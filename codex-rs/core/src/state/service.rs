@@ -9,6 +9,8 @@ use crate::mcp_connection_manager::McpConnectionManager;
 use crate::models_manager::manager::ModelsManager;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
+use crate::swarm::SwarmHub;
+use crate::swarm::SwarmRegistry;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::transport_manager::TransportManager;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -34,6 +36,8 @@ pub(crate) struct SessionServices {
     pub(crate) tool_approvals: Mutex<ApprovalStore>,
     pub(crate) skills_manager: Arc<SkillsManager>,
     pub(crate) agent_control: AgentControl,
+    pub(crate) swarm_hub: SwarmHub,
+    pub(crate) swarm_registry: SwarmRegistry,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) transport_manager: TransportManager,
 }

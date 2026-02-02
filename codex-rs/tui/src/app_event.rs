@@ -52,6 +52,8 @@ pub(crate) enum AppEvent {
     CodexEvent(Event),
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
+    /// Open the swarm dashboard overlay.
+    OpenSwarmDashboard,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
 

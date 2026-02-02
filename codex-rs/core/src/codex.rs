@@ -187,6 +187,8 @@ use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
+use crate::swarm::SwarmHub;
+use crate::swarm::SwarmRegistry;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::ReviewTask;
 use crate::tasks::SessionTask;
@@ -281,6 +283,8 @@ impl Codex {
         session_source: SessionSource,
         agent_control: AgentControl,
         dynamic_tools: Vec<DynamicToolSpec>,
+        swarm_hub: SwarmHub,
+        swarm_registry: SwarmRegistry,
     ) -> CodexResult<CodexSpawnOk> {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -328,11 +332,19 @@ impl Codex {
         // 2. conversation history => session_meta.base_instructions
         // 3. base_intructions for current model
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
-        let base_instructions = config
+        let mut base_instructions = config
             .base_instructions
             .clone()
             .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+        if config.swarm.enabled
+            && let Some(root_role) = config.swarm.root_role_name()
+            && let Some(role) = config.swarm.role(root_role)
+            && let Some(role_instructions) = role.base_instructions.as_ref()
+            && !role_instructions.trim().is_empty()
+        {
+            base_instructions = format!("{base_instructions}\n\n{role_instructions}");
+        }
         // Respect explicit thread-start tools; fall back to persisted tools when resuming a thread.
         let dynamic_tools = if dynamic_tools.is_empty() {
             conversation_history.get_dynamic_tools().unwrap_or_default()
@@ -387,6 +399,8 @@ impl Codex {
             session_source_clone,
             skills_manager,
             agent_control,
+            swarm_hub.clone(),
+            swarm_registry.clone(),
         )
         .instrument(session_init_span)
         .await
@@ -721,6 +735,8 @@ impl Session {
         session_source: SessionSource,
         skills_manager: Arc<SkillsManager>,
         agent_control: AgentControl,
+        swarm_hub: SwarmHub,
+        swarm_registry: SwarmRegistry,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -757,6 +773,16 @@ impl Session {
                 RolloutRecorderParams::resume(resumed_history.rollout_path.clone()),
             ),
         };
+        swarm_hub.apply_config(&config.swarm.hub).await;
+        if config.swarm.enabled
+            && let Some(root_role) = config.swarm.root_role_name()
+            && let Some(role) = config.swarm.role(root_role)
+        {
+            let model = Some(session_configuration.collaboration_mode.model().to_string());
+            swarm_registry
+                .register_root(conversation_id, role, model)
+                .await;
+        }
         let state_builder = match &initial_history {
             InitialHistory::Resumed(resumed) => metadata::builder_from_items(
                 resumed.history.as_slice(),
@@ -902,6 +928,10 @@ impl Session {
         session_configuration.thread_name = thread_name.clone();
         let state = SessionState::new(session_configuration.clone());
 
+        let swarm_hub = SwarmHub::new(config.codex_home.clone());
+        swarm_hub.apply_config(&config.swarm.hub).await;
+        let swarm_registry = SwarmRegistry::new();
+
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
             mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
@@ -921,6 +951,8 @@ impl Session {
             tool_approvals: Mutex::new(ApprovalStore::default()),
             skills_manager,
             agent_control,
+            swarm_hub,
+            swarm_registry,
             state_db: state_db_ctx.clone(),
             transport_manager: TransportManager::new(),
         };
@@ -5376,6 +5408,8 @@ mod tests {
             tool_approvals: Mutex::new(ApprovalStore::default()),
             skills_manager,
             agent_control,
+            swarm_hub,
+            swarm_registry,
             state_db: None,
             transport_manager: TransportManager::new(),
         };
@@ -5496,6 +5530,8 @@ mod tests {
             tool_approvals: Mutex::new(ApprovalStore::default()),
             skills_manager,
             agent_control,
+            swarm_hub,
+            swarm_registry,
             state_db: None,
             transport_manager: TransportManager::new(),
         };

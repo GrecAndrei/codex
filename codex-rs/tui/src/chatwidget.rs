@@ -2864,6 +2864,9 @@ impl ChatWidget {
             SlashCommand::Agent => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
+            SlashCommand::Swarm => {
+                self.app_event_tx.send(AppEvent::OpenSwarmDashboard);
+            }
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
             }

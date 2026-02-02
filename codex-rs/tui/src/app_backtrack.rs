@@ -107,6 +107,11 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        if !matches!(self.overlay, Some(Overlay::Transcript(_))) {
+            self.overlay_forward_event(tui, event).await?;
+            return Ok(true);
+        }
+
         if self.backtrack.overlay_preview_active {
             match event {
                 TuiEvent::Key(KeyEvent {
@@ -114,7 +119,7 @@ impl App {
                     kind: KeyEventKind::Press | KeyEventKind::Repeat,
                     ..
                 }) => {
-                    self.overlay_step_backtrack(tui, event)?;
+                    self.overlay_step_backtrack(tui, event).await?;
                     Ok(true)
                 }
                 TuiEvent::Key(KeyEvent {
@@ -122,7 +127,7 @@ impl App {
                     kind: KeyEventKind::Press | KeyEventKind::Repeat,
                     ..
                 }) => {
-                    self.overlay_step_backtrack(tui, event)?;
+                    self.overlay_step_backtrack(tui, event).await?;
                     Ok(true)
                 }
                 TuiEvent::Key(KeyEvent {
@@ -130,7 +135,7 @@ impl App {
                     kind: KeyEventKind::Press | KeyEventKind::Repeat,
                     ..
                 }) => {
-                    self.overlay_step_backtrack_forward(tui, event)?;
+                    self.overlay_step_backtrack_forward(tui, event).await?;
                     Ok(true)
                 }
                 TuiEvent::Key(KeyEvent {
@@ -143,7 +148,7 @@ impl App {
                 }
                 // Catchall: forward any other events to the overlay widget.
                 _ => {
-                    self.overlay_forward_event(tui, event)?;
+                    self.overlay_forward_event(tui, event).await?;
                     Ok(true)
                 }
             }
@@ -158,7 +163,7 @@ impl App {
             Ok(true)
         } else {
             // Not in backtrack mode: forward events to the overlay widget.
-            self.overlay_forward_event(tui, event)?;
+            self.overlay_forward_event(tui, event).await?;
             Ok(true)
         }
     }
@@ -352,7 +357,7 @@ impl App {
     /// This logic lives here (instead of inside the overlay widget) because `ChatWidget` is the
     /// source of truth for the active cell and its cache invalidation key, and because `App` owns
     /// overlay lifecycle and frame scheduling for animations.
-    fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+    async fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         if let TuiEvent::Draw = &event
             && let Some(Overlay::Transcript(t)) = &mut self.overlay
         {
@@ -380,6 +385,27 @@ impl App {
             return Ok(());
         }
 
+        if let TuiEvent::Draw = &event
+            && self
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| matches!(overlay, Overlay::Swarm(_)))
+        {
+            let width = tui.terminal.viewport_area.width.max(1);
+            let data = self.swarm_overlay_data(tui, width).await;
+            if let Some(Overlay::Swarm(swarm)) = &mut self.overlay {
+                swarm.sync(data);
+                tui.draw(u16::MAX, |frame| {
+                    swarm.render(frame.area(), frame.buffer);
+                })?;
+                if swarm.is_done() {
+                    self.close_transcript_overlay(tui);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            return Ok(());
+        }
+
         if let Some(overlay) = &mut self.overlay {
             overlay.handle_event(tui, event)?;
             if overlay.is_done() {
@@ -402,17 +428,17 @@ impl App {
     }
 
     /// Handle Esc in overlay backtrack preview: step selection if armed, else forward.
-    fn overlay_step_backtrack(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+    async fn overlay_step_backtrack(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         if self.backtrack.base_id.is_some() {
             self.step_backtrack_and_highlight(tui);
         } else {
-            self.overlay_forward_event(tui, event)?;
+            self.overlay_forward_event(tui, event).await?;
         }
         Ok(())
     }
 
     /// Handle Right in overlay backtrack preview: step selection forward if armed, else forward.
-    fn overlay_step_backtrack_forward(
+    async fn overlay_step_backtrack_forward(
         &mut self,
         tui: &mut tui::Tui,
         event: TuiEvent,
@@ -420,7 +446,7 @@ impl App {
         if self.backtrack.base_id.is_some() {
             self.step_forward_backtrack_and_highlight(tui);
         } else {
-            self.overlay_forward_event(tui, event)?;
+            self.overlay_forward_event(tui, event).await?;
         }
         Ok(())
     }

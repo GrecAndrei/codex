@@ -9,6 +9,7 @@ mod plan;
 mod read_file;
 mod request_user_input;
 mod shell;
+pub(crate) mod swarm;
 mod test_sync;
 mod unified_exec;
 mod view_image;

@@ -35,6 +35,8 @@ use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -49,6 +51,7 @@ use ratatui::widgets::Wrap;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    Swarm(SwarmOverlay),
 }
 
 impl Overlay {
@@ -67,10 +70,15 @@ impl Overlay {
         Self::Static(StaticOverlay::with_renderables(renderables, title))
     }
 
+    pub(crate) fn new_swarm() -> Self {
+        Self::Swarm(SwarmOverlay::new())
+    }
+
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::Swarm(o) => o.handle_event(tui, event),
         }
     }
 
@@ -78,6 +86,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::Swarm(o) => o.is_done(),
         }
     }
 }
@@ -94,6 +103,10 @@ const KEY_HOME: KeyBinding = key_hint::plain(KeyCode::Home);
 const KEY_END: KeyBinding = key_hint::plain(KeyCode::End);
 const KEY_LEFT: KeyBinding = key_hint::plain(KeyCode::Left);
 const KEY_RIGHT: KeyBinding = key_hint::plain(KeyCode::Right);
+const KEY_TAB: KeyBinding = key_hint::plain(KeyCode::Tab);
+const KEY_SHIFT_TAB: KeyBinding = key_hint::plain(KeyCode::BackTab);
+const KEY_BRACKET_LEFT: KeyBinding = key_hint::plain(KeyCode::Char('['));
+const KEY_BRACKET_RIGHT: KeyBinding = key_hint::plain(KeyCode::Char(']'));
 const KEY_CTRL_F: KeyBinding = key_hint::ctrl(KeyCode::Char('f'));
 const KEY_CTRL_D: KeyBinding = key_hint::ctrl(KeyCode::Char('d'));
 const KEY_CTRL_B: KeyBinding = key_hint::ctrl(KeyCode::Char('b'));
@@ -740,6 +753,384 @@ impl StaticOverlay {
     pub(crate) fn is_done(&self) -> bool {
         self.is_done
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SwarmActiveTail {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) is_stream_continuation: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SwarmAgentSnapshot {
+    pub(crate) name: String,
+    pub(crate) role: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) thread_label: String,
+    pub(crate) color: Color,
+    pub(crate) is_active: bool,
+    pub(crate) cells: Vec<Arc<dyn HistoryCell>>,
+    pub(crate) active_tail: Option<SwarmActiveTail>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SwarmOverlayData {
+    pub(crate) agents: Vec<SwarmAgentSnapshot>,
+    pub(crate) hub_lines: Vec<Line<'static>>,
+    pub(crate) version: u64,
+    pub(crate) width: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmTab {
+    All,
+    Agent,
+    Hub,
+}
+
+impl SwarmTab {
+    fn label(self) -> &'static str {
+        match self {
+            SwarmTab::All => "All",
+            SwarmTab::Agent => "Agent",
+            SwarmTab::Hub => "Hub",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SwarmTab::All => SwarmTab::Agent,
+            SwarmTab::Agent => SwarmTab::Hub,
+            SwarmTab::Hub => SwarmTab::All,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            SwarmTab::All => SwarmTab::Hub,
+            SwarmTab::Agent => SwarmTab::All,
+            SwarmTab::Hub => SwarmTab::Agent,
+        }
+    }
+}
+
+pub(crate) struct SwarmOverlay {
+    view: PagerView,
+    tab: SwarmTab,
+    selected_agent: usize,
+    agents: Vec<SwarmAgentSnapshot>,
+    hub_lines: Vec<Line<'static>>,
+    is_done: bool,
+    last_version: u64,
+    last_width: u16,
+}
+
+impl SwarmOverlay {
+    pub(crate) fn new() -> Self {
+        Self {
+            view: PagerView::new(Vec::new(), "S W A R M".to_string(), usize::MAX),
+            tab: SwarmTab::All,
+            selected_agent: 0,
+            agents: Vec::new(),
+            hub_lines: Vec::new(),
+            is_done: false,
+            last_version: 0,
+            last_width: 0,
+        }
+    }
+
+    pub(crate) fn sync(&mut self, data: SwarmOverlayData) {
+        self.agents = data.agents;
+        self.hub_lines = data.hub_lines;
+        if self.selected_agent >= self.agents.len() && !self.agents.is_empty() {
+            self.selected_agent = self.agents.len().saturating_sub(1);
+        }
+
+        let needs_rebuild = data.version != self.last_version || data.width != self.last_width;
+        self.last_version = data.version;
+        self.last_width = data.width;
+        if needs_rebuild {
+            self.rebuild_renderables();
+        }
+    }
+
+    fn rebuild_renderables(&mut self) {
+        self.view.renderables = match self.tab {
+            SwarmTab::All => self.build_all_renderables(),
+            SwarmTab::Agent => self.build_agent_renderables(),
+            SwarmTab::Hub => self.build_hub_renderables(),
+        };
+    }
+
+    fn build_tabs_line(&self) -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = vec![" ".into()];
+        for tab in [SwarmTab::All, SwarmTab::Agent, SwarmTab::Hub] {
+            let label = match tab {
+                SwarmTab::Agent => self
+                    .current_agent_label()
+                    .map(|label| format!("Agent: {label}"))
+                    .unwrap_or_else(|| "Agent".to_string()),
+                _ => tab.label().to_string(),
+            };
+            let styled = if tab == self.tab {
+                Span::styled(label, Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Span::from(label)
+            };
+            spans.push("[".into());
+            spans.push(styled);
+            spans.push("]".into());
+            spans.push("  ".into());
+        }
+        spans.into()
+    }
+
+    fn current_agent_label(&self) -> Option<String> {
+        self.agents
+            .get(self.selected_agent)
+            .map(|agent| agent.name.clone())
+    }
+
+    fn build_all_renderables(&self) -> Vec<Box<dyn Renderable>> {
+        let mut renderables: Vec<Box<dyn Renderable>> = Vec::new();
+        renderables.push(Box::new(CachedRenderable::new(self.build_tabs_line())));
+        for (idx, agent) in self.agents.iter().enumerate() {
+            if idx > 0 {
+                renderables.push(Box::new(Line::from("")));
+            }
+            renderables.extend(self.build_agent_section(agent, true));
+        }
+        if self.agents.is_empty() {
+            renderables.push(Box::new(Line::from("No agents yet.".dim())));
+        }
+        renderables
+    }
+
+    fn build_agent_renderables(&self) -> Vec<Box<dyn Renderable>> {
+        let mut renderables: Vec<Box<dyn Renderable>> =
+            vec![Box::new(CachedRenderable::new(self.build_tabs_line()))];
+        if let Some(agent) = self.agents.get(self.selected_agent) {
+            renderables.extend(self.build_agent_section(agent, true));
+        } else {
+            renderables.push(Box::new(Line::from("No agents yet.".dim())));
+        }
+        renderables
+    }
+
+    fn build_hub_renderables(&self) -> Vec<Box<dyn Renderable>> {
+        let mut renderables: Vec<Box<dyn Renderable>> =
+            vec![Box::new(CachedRenderable::new(self.build_tabs_line()))];
+        if self.hub_lines.is_empty() {
+            renderables.push(Box::new(Line::from("Swarm Hub is empty.".dim())));
+            return renderables;
+        }
+        let paragraph = Paragraph::new(Text::from(self.hub_lines.clone()));
+        renderables.push(Box::new(CachedRenderable::new(paragraph)));
+        renderables
+    }
+
+    fn build_agent_section(
+        &self,
+        agent: &SwarmAgentSnapshot,
+        include_header: bool,
+    ) -> Vec<Box<dyn Renderable>> {
+        let mut renderables: Vec<Box<dyn Renderable>> = Vec::new();
+        if include_header {
+            renderables.push(Box::new(CachedRenderable::new(agent_header_line(agent))));
+        }
+
+        let mut cells = Self::render_agent_cells(&agent.cells, agent.color, include_header);
+        renderables.append(&mut cells);
+
+        if let Some(tail) = agent.active_tail.as_ref() {
+            let has_prior = include_header || !agent.cells.is_empty();
+            renderables.push(Self::active_tail_renderable(tail, has_prior, agent.color));
+        }
+
+        if agent.cells.is_empty() && agent.active_tail.is_none() {
+            let empty_style = Style::default().fg(agent.color).add_modifier(Modifier::DIM);
+            renderables.push(Box::new(Line::from(Span::styled(
+                "No activity yet.",
+                empty_style,
+            ))));
+        }
+
+        renderables
+    }
+
+    fn render_agent_cells(
+        cells: &[Arc<dyn HistoryCell>],
+        color: Color,
+        pad_first: bool,
+    ) -> Vec<Box<dyn Renderable>> {
+        let mut out: Vec<Box<dyn Renderable>> = Vec::new();
+        let mut first = true;
+        for (i, cell) in cells.iter().enumerate() {
+            let style = if cell.as_any().is::<UserHistoryCell>() {
+                user_message_style().fg(color)
+            } else {
+                Style::default().fg(color)
+            };
+            let mut renderable: Box<dyn Renderable> =
+                Box::new(CachedRenderable::new(CellRenderable {
+                    cell: cell.clone(),
+                    style,
+                }));
+            let needs_inset = (!cell.is_stream_continuation() && i > 0) || (pad_first && first);
+            if needs_inset {
+                renderable = Box::new(InsetRenderable::new(renderable, Insets::tlbr(1, 0, 0, 0)));
+            }
+            out.push(renderable);
+            first = false;
+        }
+        out
+    }
+
+    fn active_tail_renderable(
+        tail: &SwarmActiveTail,
+        has_prior_cells: bool,
+        color: Color,
+    ) -> Box<dyn Renderable> {
+        let paragraph =
+            Paragraph::new(Text::from(tail.lines.clone())).style(Style::default().fg(color));
+        let mut renderable: Box<dyn Renderable> = Box::new(CachedRenderable::new(paragraph));
+        if has_prior_cells && !tail.is_stream_continuation {
+            renderable = Box::new(InsetRenderable::new(renderable, Insets::tlbr(1, 0, 0, 0)));
+        }
+        renderable
+    }
+
+    fn render_hints(&self, area: Rect, buf: &mut Buffer) {
+        let line1 = Rect::new(area.x, area.y, area.width, 1);
+        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+        render_key_hints(line1, buf, PAGER_KEY_HINTS);
+        let mut pairs: Vec<(&[KeyBinding], &str)> = vec![
+            (&[KEY_Q, KEY_ESC], "to quit"),
+            (&[KEY_TAB, KEY_SHIFT_TAB], "to switch tabs"),
+        ];
+        if self.tab == SwarmTab::Agent {
+            pairs.push((&[KEY_BRACKET_LEFT, KEY_BRACKET_RIGHT], "agent prev/next"));
+        }
+        render_key_hints(line2, buf, &pairs);
+    }
+
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let top_h = area.height.saturating_sub(3);
+        let top = Rect::new(area.x, area.y, area.width, top_h);
+        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
+        self.view.render(top, buf);
+        self.render_hints(bottom, buf);
+    }
+
+    fn advance_tab(&mut self, forward: bool) {
+        self.tab = if forward {
+            self.tab.next()
+        } else {
+            self.tab.prev()
+        };
+        self.view.scroll_offset = usize::MAX;
+        self.rebuild_renderables();
+    }
+
+    fn step_agent(&mut self, forward: bool) {
+        if self.agents.is_empty() {
+            return;
+        }
+        if forward {
+            self.selected_agent = (self.selected_agent + 1) % self.agents.len();
+        } else if self.selected_agent == 0 {
+            self.selected_agent = self.agents.len().saturating_sub(1);
+        } else {
+            self.selected_agent = self.selected_agent.saturating_sub(1);
+        }
+        self.view.scroll_offset = usize::MAX;
+        if self.tab == SwarmTab::Agent {
+            self.rebuild_renderables();
+        }
+    }
+}
+
+impl SwarmOverlay {
+    pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+        match event {
+            TuiEvent::Key(key_event) => match key_event {
+                e if KEY_Q.is_press(e) || KEY_CTRL_C.is_press(e) || KEY_ESC.is_press(e) => {
+                    self.is_done = true;
+                    Ok(())
+                }
+                e if KEY_TAB.is_press(e) => {
+                    self.advance_tab(true);
+                    tui.frame_requester().schedule_frame();
+                    Ok(())
+                }
+                e if KEY_SHIFT_TAB.is_press(e) => {
+                    self.advance_tab(false);
+                    tui.frame_requester().schedule_frame();
+                    Ok(())
+                }
+                e if KEY_BRACKET_LEFT.is_press(e) => {
+                    self.step_agent(false);
+                    tui.frame_requester().schedule_frame();
+                    Ok(())
+                }
+                e if KEY_BRACKET_RIGHT.is_press(e) => {
+                    self.step_agent(true);
+                    tui.frame_requester().schedule_frame();
+                    Ok(())
+                }
+                other => self.view.handle_key_event(tui, other),
+            },
+            TuiEvent::Draw => {
+                tui.draw(u16::MAX, |frame| {
+                    self.render(frame.area(), frame.buffer);
+                })?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.is_done
+    }
+}
+
+fn agent_header_line(agent: &SwarmAgentSnapshot) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut name = agent.name.clone();
+    if agent.is_active {
+        name.push_str(" *");
+    }
+    spans.push(Span::styled(
+        name,
+        Style::default()
+            .fg(agent.color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if let Some(role) = agent.role.as_ref() {
+        if role != &agent.name {
+            spans.push(" ".into());
+            spans.push(Span::styled(
+                format!("({role})"),
+                Style::default().fg(agent.color).add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    if let Some(model) = agent.model.as_ref() {
+        spans.push("  ".into());
+        spans.push(Span::styled(
+            model.clone(),
+            Style::default().fg(agent.color).add_modifier(Modifier::DIM),
+        ));
+    }
+    if !agent.thread_label.is_empty() {
+        spans.push("  ".into());
+        spans.push(Span::styled(
+            agent.thread_label.clone(),
+            Style::default().fg(agent.color).add_modifier(Modifier::DIM),
+        ));
+    }
+    spans.into()
 }
 
 fn render_offset_content(

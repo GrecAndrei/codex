@@ -18,6 +18,8 @@ use crate::protocol::SessionConfiguredEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
 use crate::skills::SkillsManager;
+use crate::swarm::SwarmHub;
+use crate::swarm::SwarmRegistry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
@@ -62,6 +64,8 @@ pub(crate) struct ThreadManagerState {
     auth_manager: Arc<AuthManager>,
     models_manager: Arc<ModelsManager>,
     skills_manager: Arc<SkillsManager>,
+    swarm_hub: SwarmHub,
+    swarm_registry: SwarmRegistry,
     session_source: SessionSource,
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
@@ -84,7 +88,9 @@ impl ThreadManager {
                     codex_home.clone(),
                     auth_manager.clone(),
                 )),
-                skills_manager: Arc::new(SkillsManager::new(codex_home)),
+                skills_manager: Arc::new(SkillsManager::new(codex_home.clone())),
+                swarm_hub: SwarmHub::new(codex_home.clone()),
+                swarm_registry: SwarmRegistry::new(),
                 auth_manager,
                 session_source,
                 #[cfg(any(test, feature = "test-support"))]
@@ -125,7 +131,9 @@ impl ThreadManager {
                     auth_manager.clone(),
                     provider,
                 )),
-                skills_manager: Arc::new(SkillsManager::new(codex_home)),
+                skills_manager: Arc::new(SkillsManager::new(codex_home.clone())),
+                swarm_hub: SwarmHub::new(codex_home.clone()),
+                swarm_registry: SwarmRegistry::new(),
                 auth_manager,
                 session_source: SessionSource::Exec,
                 #[cfg(any(test, feature = "test-support"))]
@@ -160,6 +168,14 @@ impl ThreadManager {
 
     pub fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
         self.state.models_manager.list_collaboration_modes()
+    }
+
+    pub fn swarm_hub(&self) -> SwarmHub {
+        self.state.swarm_hub.clone()
+    }
+
+    pub fn swarm_registry(&self) -> SwarmRegistry {
+        self.state.swarm_registry.clone()
     }
 
     pub async fn list_thread_ids(&self) -> Vec<ThreadId> {
@@ -391,6 +407,8 @@ impl ThreadManagerState {
             session_source,
             agent_control,
             dynamic_tools,
+            self.swarm_hub.clone(),
+            self.swarm_registry.clone(),
         )
         .await?;
         self.finalize_thread_spawn(codex, thread_id).await

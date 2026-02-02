@@ -24,6 +24,36 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 - https://developers.openai.com/codex/config-reference
 
+## Swarm (multi-agent)
+
+Swarm settings live under the `[swarm]` table in `config.toml` and are optional.
+Keys use `camelCase` to match the schema.
+
+Example:
+
+```toml
+[swarm]
+enabled = true
+rootRole = "Scholar"
+defaultSpawnRole = "Scribe"
+
+[[swarm.roles]]
+name = "Scout"
+model = "gpt-5.1-codex-mini"
+tier = 0
+baseInstructions = "High-speed triage and acquisition."
+
+[swarm.hierarchy]
+allowUpwardCalls = false
+allowSameTierCalls = true
+
+[swarm.hub]
+leakTrackerPath = "C:\\\\Users\\\\you\\\\.codex\\\\swarm\\\\leaks.json"
+storageDir = "C:\\\\Users\\\\you\\\\.codex\\\\swarm"
+```
+
+Swarm Hub state is shared across all swarm agents in a session.
+
 ## JSON Schema
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.

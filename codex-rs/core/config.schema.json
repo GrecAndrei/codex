@@ -973,6 +973,78 @@
       },
       "type": "object"
     },
+    "SwarmHierarchyToml": {
+      "properties": {
+        "allowSameTierCalls": {
+          "type": "boolean"
+        },
+        "allowUpwardCalls": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "SwarmHubToml": {
+      "properties": {
+        "leakTrackerPath": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "storageDir": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "type": "object"
+    },
+    "SwarmRoleToml": {
+      "properties": {
+        "baseInstructions": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "tier": {
+          "format": "int32",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "SwarmToml": {
+      "properties": {
+        "defaultSpawnRole": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "hierarchy": {
+          "$ref": "#/definitions/SwarmHierarchyToml"
+        },
+        "hub": {
+          "$ref": "#/definitions/SwarmHubToml"
+        },
+        "roles": {
+          "items": {
+            "$ref": "#/definitions/SwarmRoleToml"
+          },
+          "type": "array"
+        },
+        "rootRole": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "ToolsToml": {
       "additionalProperties": false,
       "properties": {
@@ -1531,6 +1603,14 @@
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",
       "type": "boolean"
+    },
+    "swarm": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SwarmToml"
+        }
+      ],
+      "description": "Swarm configuration (roles, hub, hierarchy)."
     },
     "tool_output_token_limit": {
       "description": "Token budget applied when storing tool/function outputs in the context manager.",

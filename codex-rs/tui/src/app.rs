@@ -26,6 +26,9 @@ use crate::model_migration::ModelMigrationOutcome;
 use crate::model_migration::migration_copy_for_models;
 use crate::model_migration::run_model_migration_prompt;
 use crate::pager_overlay::Overlay;
+use crate::pager_overlay::SwarmActiveTail;
+use crate::pager_overlay::SwarmAgentSnapshot;
+use crate::pager_overlay::SwarmOverlayData;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
@@ -58,6 +61,8 @@ use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::SessionSource;
 use codex_core::protocol::SkillErrorInfo;
 use codex_core::protocol::TokenUsage;
+use codex_core::swarm::SwarmAgentInfo;
+use codex_core::swarm::SwarmHubState;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_otel::OtelManager;
@@ -76,6 +81,7 @@ use color_eyre::eyre::WrapErr;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use ratatui::style::Color;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
@@ -92,10 +98,12 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use textwrap::Options;
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
@@ -248,6 +256,14 @@ struct ThreadEventSnapshot {
     events: Vec<Event>,
 }
 
+#[derive(Debug, Clone)]
+struct ThreadEventDelta {
+    session_configured: Option<Event>,
+    events: Vec<Event>,
+    last_seq: Option<u64>,
+    reset: bool,
+}
+
 #[derive(Debug)]
 struct ThreadEventStore {
     session_configured: Option<Event>,
@@ -255,6 +271,8 @@ struct ThreadEventStore {
     user_message_ids: HashSet<String>,
     capacity: usize,
     active: bool,
+    first_seq: u64,
+    next_seq: u64,
 }
 
 impl ThreadEventStore {
@@ -265,6 +283,8 @@ impl ThreadEventStore {
             user_message_ids: HashSet::new(),
             capacity,
             active: false,
+            first_seq: 0,
+            next_seq: 0,
         }
     }
 
@@ -306,13 +326,18 @@ impl ThreadEventStore {
         {
             return;
         }
+        if self.buffer.is_empty() {
+            self.first_seq = self.next_seq;
+        }
         self.buffer.push_back(event);
+        self.next_seq = self.next_seq.saturating_add(1);
         if self.buffer.len() > self.capacity
             && let Some(removed) = self.buffer.pop_front()
-            && matches!(removed.msg, EventMsg::UserMessage(_))
-            && !removed.id.is_empty()
         {
-            self.user_message_ids.remove(&removed.id);
+            if matches!(removed.msg, EventMsg::UserMessage(_)) && !removed.id.is_empty() {
+                self.user_message_ids.remove(&removed.id);
+            }
+            self.first_seq = self.first_seq.saturating_add(1);
         }
     }
 
@@ -320,6 +345,67 @@ impl ThreadEventStore {
         ThreadEventSnapshot {
             session_configured: self.session_configured.clone(),
             events: self.buffer.iter().cloned().collect(),
+        }
+    }
+
+    fn delta_since(&self, after_seq: Option<u64>) -> ThreadEventDelta {
+        let latest_seq = self.next_seq.checked_sub(1);
+        if after_seq.is_none() {
+            return ThreadEventDelta {
+                session_configured: self.session_configured.clone(),
+                events: self.buffer.iter().cloned().collect(),
+                last_seq: latest_seq,
+                reset: true,
+            };
+        }
+
+        let Some(after_seq) = after_seq else {
+            unreachable!("after_seq checked above")
+        };
+
+        if self.buffer.is_empty() {
+            return ThreadEventDelta {
+                session_configured: None,
+                events: Vec::new(),
+                last_seq: Some(after_seq),
+                reset: false,
+            };
+        }
+
+        if after_seq < self.first_seq {
+            return ThreadEventDelta {
+                session_configured: self.session_configured.clone(),
+                events: self.buffer.iter().cloned().collect(),
+                last_seq: latest_seq,
+                reset: true,
+            };
+        }
+
+        let Some(latest_seq) = latest_seq else {
+            return ThreadEventDelta {
+                session_configured: None,
+                events: Vec::new(),
+                last_seq: Some(after_seq),
+                reset: false,
+            };
+        };
+
+        if after_seq >= latest_seq {
+            return ThreadEventDelta {
+                session_configured: None,
+                events: Vec::new(),
+                last_seq: Some(after_seq),
+                reset: false,
+            };
+        }
+
+        let start = after_seq.saturating_add(1).saturating_sub(self.first_seq) as usize;
+        let events = self.buffer.iter().skip(start).cloned().collect();
+        ThreadEventDelta {
+            session_configured: None,
+            events,
+            last_seq: Some(latest_seq),
+            reset: false,
         }
     }
 }
@@ -350,6 +436,67 @@ impl ThreadEventChannel {
                 capacity, event,
             ))),
         }
+    }
+}
+
+#[derive(Default)]
+struct SwarmTranscriptCache {
+    threads: HashMap<ThreadId, SwarmThreadTranscript>,
+    version: u64,
+    last_hub_state: Option<SwarmHubState>,
+}
+
+struct SwarmThreadTranscript {
+    last_seq: Option<u64>,
+    widget: ChatWidget,
+    app_event_rx: UnboundedReceiver<AppEvent>,
+    cells: Vec<Arc<dyn HistoryCell>>,
+}
+
+impl SwarmTranscriptCache {
+    fn mark_dirty(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+
+    fn remove_missing(&mut self, live: &HashSet<ThreadId>) {
+        let before = self.threads.len();
+        self.threads.retain(|thread_id, _| live.contains(thread_id));
+        if self.threads.len() != before {
+            self.mark_dirty();
+        }
+    }
+
+    fn update_hub_state(&mut self, hub_state: Option<&SwarmHubState>) {
+        if self.last_hub_state.as_ref() != hub_state {
+            self.last_hub_state = hub_state.cloned();
+            self.mark_dirty();
+        }
+    }
+}
+
+impl SwarmThreadTranscript {
+    fn drain_history(&mut self) {
+        loop {
+            match self.app_event_rx.try_recv() {
+                Ok(AppEvent::InsertHistoryCell(cell)) => {
+                    let cell: Arc<dyn HistoryCell> = cell.into();
+                    self.cells.push(cell);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn replay_events<I>(&mut self, events: I)
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        for event in events {
+            self.widget.handle_codex_event_replay(event);
+        }
+        self.drain_history();
     }
 }
 
@@ -530,6 +677,7 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+    swarm_transcripts: SwarmTranscriptCache,
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
@@ -814,6 +962,12 @@ impl App {
         });
     }
 
+    fn open_swarm_dashboard(&mut self, tui: &mut tui::Tui) {
+        let _ = tui.enter_alt_screen();
+        self.overlay = Some(Overlay::new_swarm());
+        tui.frame_requester().schedule_frame();
+    }
+
     async fn select_agent_thread(&mut self, tui: &mut tui::Tui, thread_id: ThreadId) -> Result<()> {
         if self.active_thread_id == Some(thread_id) {
             return Ok(());
@@ -873,6 +1027,7 @@ impl App {
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
+        self.swarm_transcripts = SwarmTranscriptCache::default();
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
@@ -910,6 +1065,165 @@ impl App {
         }
         for event in snapshot.events {
             self.handle_codex_event_replay(event);
+        }
+    }
+
+    fn make_swarm_transcript(&self, tui: &tui::Tui) -> SwarmThreadTranscript {
+        let (app_event_tx, app_event_rx) = unbounded_channel();
+        let app_event_tx = AppEventSender::new_unlogged(app_event_tx);
+        let init = crate::chatwidget::ChatWidgetInit {
+            config: self.config.clone(),
+            frame_requester: tui.frame_requester(),
+            app_event_tx,
+            initial_user_message: None,
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager: self.server.get_models_manager(),
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            feedback_audience: self.feedback_audience,
+            model: None,
+            otel_manager: self.otel_manager.clone(),
+        };
+        let (op_tx, _op_rx) = unbounded_channel();
+        let widget = ChatWidget::new_with_op_sender(init, op_tx);
+        SwarmThreadTranscript {
+            last_seq: None,
+            widget,
+            app_event_rx,
+            cells: Vec::new(),
+        }
+    }
+
+    pub(crate) async fn swarm_overlay_data(
+        &mut self,
+        tui: &tui::Tui,
+        width: u16,
+    ) -> SwarmOverlayData {
+        let registry = self.server.swarm_registry().snapshot().await;
+        let mut registry_map: HashMap<ThreadId, SwarmAgentInfo> = HashMap::new();
+        for info in registry {
+            registry_map.insert(info.thread_id, info);
+        }
+
+        let mut thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().copied().collect();
+        if let Some(active_id) = self.active_thread_id
+            && !thread_ids.contains(&active_id)
+        {
+            thread_ids.push(active_id);
+        }
+        thread_ids.sort_by(|a, b| {
+            let a_tier = registry_map.get(a).map(|info| info.tier).unwrap_or(0);
+            let b_tier = registry_map.get(b).map(|info| info.tier).unwrap_or(0);
+            b_tier
+                .cmp(&a_tier)
+                .then_with(|| a.to_string().cmp(&b.to_string()))
+        });
+
+        let mut live_threads: HashSet<ThreadId> = HashSet::new();
+        let mut agents: Vec<SwarmAgentSnapshot> = Vec::new();
+        for (idx, thread_id) in thread_ids.iter().enumerate() {
+            live_threads.insert(*thread_id);
+            let Some(channel) = self.thread_event_channels.get(thread_id) else {
+                continue;
+            };
+            let last_seq = self
+                .swarm_transcripts
+                .threads
+                .get(thread_id)
+                .and_then(|thread| thread.last_seq);
+            let delta = {
+                let store = channel.store.lock().await;
+                store.delta_since(last_seq)
+            };
+
+            let needs_reset =
+                delta.reset || !self.swarm_transcripts.threads.contains_key(thread_id);
+            let mut mark_dirty = false;
+            if needs_reset {
+                let mut transcript = self.make_swarm_transcript(tui);
+                if let Some(session) = delta.session_configured.clone() {
+                    transcript.replay_events([session]);
+                }
+                transcript.replay_events(delta.events.clone());
+                transcript.last_seq = delta.last_seq;
+                self.swarm_transcripts
+                    .threads
+                    .insert(*thread_id, transcript);
+                mark_dirty = true;
+            } else if let Some(transcript) = self.swarm_transcripts.threads.get_mut(thread_id) {
+                if let Some(session) = delta.session_configured.clone() {
+                    transcript.replay_events([session]);
+                }
+                if !delta.events.is_empty() {
+                    transcript.replay_events(delta.events.clone());
+                    mark_dirty = true;
+                }
+                if delta.last_seq.is_some() {
+                    transcript.last_seq = delta.last_seq;
+                }
+            }
+            if mark_dirty {
+                self.swarm_transcripts.mark_dirty();
+            }
+
+            let Some(transcript) = self.swarm_transcripts.threads.get(thread_id) else {
+                continue;
+            };
+            let info = registry_map.get(thread_id);
+            let name = transcript
+                .widget
+                .thread_name()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| {
+                    info.map(|info| info.role.clone())
+                        .unwrap_or_else(|| "Agent".to_string())
+                });
+            let role = info.map(|info| info.role.clone());
+            let model = Some(transcript.widget.current_model().to_string());
+            let thread_label = format_thread_label(*thread_id);
+            let color = swarm_agent_color(info, idx);
+            let is_active = self.active_thread_id == Some(*thread_id);
+            let active_tail = transcript
+                .widget
+                .active_cell_transcript_key()
+                .and_then(|key| {
+                    transcript
+                        .widget
+                        .active_cell_transcript_lines(width)
+                        .map(|lines| SwarmActiveTail {
+                            lines,
+                            is_stream_continuation: key.is_stream_continuation,
+                        })
+                });
+
+            agents.push(SwarmAgentSnapshot {
+                name,
+                role,
+                model,
+                thread_label,
+                color,
+                is_active,
+                cells: transcript.cells.clone(),
+                active_tail,
+            });
+        }
+
+        self.swarm_transcripts.remove_missing(&live_threads);
+
+        let hub_state = if self.config.swarm.enabled {
+            Some(self.server.swarm_hub().snapshot().await)
+        } else {
+            None
+        };
+        self.swarm_transcripts.update_hub_state(hub_state.as_ref());
+        let hub_lines = build_swarm_hub_lines(hub_state.as_ref(), width);
+
+        SwarmOverlayData {
+            agents,
+            hub_lines,
+            version: self.swarm_transcripts.version,
+            width,
         }
     }
 
@@ -1095,6 +1409,7 @@ impl App {
             file_search,
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
+            swarm_transcripts: SwarmTranscriptCache::default(),
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -2118,6 +2433,9 @@ impl App {
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker();
             }
+            AppEvent::OpenSwarmDashboard => {
+                self.open_swarm_dashboard(tui);
+            }
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread(tui, thread_id).await?;
             }
@@ -2504,6 +2822,232 @@ impl App {
     }
 }
 
+fn swarm_agent_color(info: Option<&SwarmAgentInfo>, index: usize) -> Color {
+    if let Some(info) = info {
+        let role = info.role.to_ascii_lowercase();
+        if role.contains("scholar") {
+            return Color::Magenta;
+        }
+        if role.contains("scribe") {
+            return Color::Cyan;
+        }
+        if role.contains("scout") {
+            return Color::Green;
+        }
+    }
+    const COLORS: [Color; 6] = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Magenta,
+        Color::Blue,
+        Color::Red,
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+fn format_thread_label(thread_id: ThreadId) -> String {
+    let full = thread_id.to_string();
+    let short: String = full.chars().take(8).collect();
+    format!("id:{short}")
+}
+
+fn build_swarm_hub_lines(hub_state: Option<&SwarmHubState>, width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let width = width.max(24) as usize;
+    let Some(hub_state) = hub_state else {
+        lines.push(Line::from("Swarm Hub disabled.".dim()));
+        return lines;
+    };
+
+    let now_ms = now_unix_ms();
+
+    lines.push(Line::from("Timer".bold()));
+    if hub_state.timer.running {
+        let started = hub_state.timer.started_at_unix_ms.unwrap_or(now_ms);
+        let elapsed = now_ms.saturating_sub(started);
+        let mut text = String::from("running");
+        if let Some(label) = hub_state.timer.label.as_ref() {
+            text.push_str(&format!(" - {label}"));
+        }
+        if let Some(duration) = hub_state.timer.duration_ms {
+            let duration_ms = u128::from(duration);
+            let remaining = duration_ms.saturating_sub(elapsed);
+            text.push_str(&format!(
+                " ({} elapsed, {} remaining)",
+                format_duration_ms(elapsed),
+                format_duration_ms(remaining)
+            ));
+        } else {
+            text.push_str(&format!(" ({} elapsed)", format_duration_ms(elapsed)));
+        }
+        push_wrapped_lines(&mut lines, &text, width, "  ", "  ");
+    } else {
+        lines.push(Line::from("  idle".dim()));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Votes".bold()));
+    if hub_state.votes.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for vote in hub_state.votes.iter().rev().take(3) {
+            let count = vote.votes.len();
+            let topic = &vote.topic;
+            let mut text = format!("{topic} ({count} votes)");
+            if vote.votes.is_empty() {
+                text.push_str(" - no votes yet");
+            }
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+            let mut counts: HashMap<String, i32> = HashMap::new();
+            for cast in &vote.votes {
+                *counts.entry(cast.option.clone()).or_insert(0) += cast.weight;
+            }
+            for option in &vote.options {
+                let count = counts.get(option).copied().unwrap_or(0);
+                let opt_text = format!("{option}: {count}");
+                push_wrapped_lines(&mut lines, &opt_text, width, "    ", "    ");
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Lounge".bold()));
+    if hub_state.lounge.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for entry in hub_state.lounge.iter().rev().take(5) {
+            let age = now_ms.saturating_sub(entry.created_at_unix_ms);
+            let mut text = entry.text.clone();
+            text.push_str(&format!(" (age {})", format_duration_ms(age)));
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Leak Tracker".bold()));
+    if hub_state.leak_tracker.entries.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for entry in hub_state.leak_tracker.entries.iter().rev().take(5) {
+            let mut text = entry.label.clone();
+            if let Some(severity) = entry.severity.as_ref() {
+                text.push_str(&format!(" [{severity}]"));
+            }
+            text.push_str(&format!(": {value}", value = entry.value));
+            if let Some(context) = entry.context.as_ref() {
+                text.push_str(&format!(" ({context})"));
+            }
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Tasks".bold()));
+    if hub_state.tasks.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for task in hub_state.tasks.iter().rev().take(5) {
+            let title = &task.title;
+            let status = &task.status;
+            let mut text = format!("{title} ({status})");
+            if let Some(notes) = task.notes.as_ref() {
+                text.push_str(&format!(" - {notes}"));
+            }
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Evidence".bold()));
+    if hub_state.evidence.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for entry in hub_state.evidence.iter().rev().take(5) {
+            let mut text = entry.summary.clone();
+            if let Some(severity) = entry.severity.as_ref() {
+                text.push_str(&format!(" [{severity}]"));
+            }
+            if let Some(source) = entry.source.as_ref() {
+                text.push_str(&format!(" - {source}"));
+            }
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Decisions".bold()));
+    if hub_state.decisions.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for entry in hub_state.decisions.iter().rev().take(5) {
+            let mut text = entry.summary.clone();
+            if let Some(rationale) = entry.rationale.as_ref() {
+                text.push_str(&format!(" - {rationale}"));
+            }
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Artifacts".bold()));
+    if hub_state.artifacts.is_empty() {
+        lines.push(Line::from("  none".dim()));
+    } else {
+        for entry in hub_state.artifacts.iter().rev().take(5) {
+            let mut text = entry.label.clone();
+            if let Some(path) = entry.path.as_ref() {
+                text.push_str(&format!(" ({path})"));
+            }
+            push_wrapped_lines(&mut lines, &text, width, "  - ", "    ");
+        }
+    }
+
+    lines
+}
+
+fn push_wrapped_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    initial_indent: &str,
+    subsequent_indent: &str,
+) {
+    let options = Options::new(width)
+        .initial_indent(initial_indent)
+        .subsequent_indent(subsequent_indent);
+    for line in textwrap::wrap(text, options) {
+        lines.push(Line::from(line.into_owned()));
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+}
+
+fn format_duration_ms(ms: u128) -> String {
+    let total_seconds = ms / 1000;
+    if total_seconds < 60 {
+        return format!("{total_seconds}s");
+    }
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m{seconds}s");
+    }
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    if hours < 24 {
+        return format!("{hours}h{minutes}m");
+    }
+    let days = hours / 24;
+    let hours = hours % 24;
+    format!("{days}d{hours}h")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2626,6 +3170,7 @@ mod tests {
             runtime_sandbox_policy_override: None,
             file_search,
             transcript_cells: Vec::new(),
+            swarm_transcripts: SwarmTranscriptCache::default(),
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -2679,6 +3224,7 @@ mod tests {
                 runtime_sandbox_policy_override: None,
                 file_search,
                 transcript_cells: Vec::new(),
+                swarm_transcripts: SwarmTranscriptCache::default(),
                 overlay: None,
                 deferred_history_lines: Vec::new(),
                 has_emitted_history_lines: false,

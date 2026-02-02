@@ -55,6 +55,7 @@ mod proposed_plan_parser;
 pub mod sandboxing;
 mod session_prefix;
 mod stream_events_utils;
+pub mod swarm;
 mod tagged_block_parser;
 mod text_encoding;
 pub mod token_data;

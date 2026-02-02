@@ -24,6 +24,41 @@ use serde::de::Error as SerdeError;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SwarmRoleToml {
+    pub name: String,
+    pub model: Option<String>,
+    pub base_instructions: Option<String>,
+    pub tier: Option<i32>,
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SwarmHierarchyToml {
+    pub allow_upward_calls: Option<bool>,
+    pub allow_same_tier_calls: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SwarmHubToml {
+    pub leak_tracker_path: Option<AbsolutePathBuf>,
+    pub storage_dir: Option<AbsolutePathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SwarmToml {
+    pub enabled: Option<bool>,
+    pub root_role: Option<String>,
+    pub default_spawn_role: Option<String>,
+    pub roles: Option<Vec<SwarmRoleToml>>,
+    pub hierarchy: Option<SwarmHierarchyToml>,
+    pub hub: Option<SwarmHubToml>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerDisabledReason {
     Unknown,

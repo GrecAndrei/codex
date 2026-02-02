@@ -9,6 +9,7 @@ use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
 use crate::tools::handlers::collab::DEFAULT_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::collab::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::collab::MIN_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::swarm::SwarmHubHandler;
 use crate::tools::registry::ToolRegistryBuilder;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -465,6 +466,15 @@ fn create_spawn_agent_tool() -> ToolSpec {
             )),
         },
     );
+    properties.insert(
+        "swarm_role".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional swarm role name (configured in settings). Specify either swarm_role or agent_type."
+                    .to_string(),
+            ),
+        },
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
@@ -547,6 +557,154 @@ fn create_wait_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["ids".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_swarm_hub_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "action".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Swarm hub action. Examples: lounge_append, lounge_read, lounge_clear, vote_create, vote_cast, vote_status, timer_start, timer_stop, timer_status, leak_tracker_set_path, leak_tracker_add, leak_tracker_list, leak_tracker_clear, task_add, task_list, evidence_add, evidence_list, decision_add, decision_list, artifact_add, artifact_list."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "text".to_string(),
+        JsonSchema::String {
+            description: Some("Lounge text to append.".to_string()),
+        },
+    );
+    properties.insert(
+        "limit".to_string(),
+        JsonSchema::Number {
+            description: Some("Optional limit for list actions.".to_string()),
+        },
+    );
+    properties.insert(
+        "topic".to_string(),
+        JsonSchema::String {
+            description: Some("Vote topic.".to_string()),
+        },
+    );
+    properties.insert(
+        "options".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some("Vote options.".to_string()),
+        },
+    );
+    properties.insert(
+        "vote_id".to_string(),
+        JsonSchema::String {
+            description: Some("Vote id.".to_string()),
+        },
+    );
+    properties.insert(
+        "option".to_string(),
+        JsonSchema::String {
+            description: Some("Vote option to cast.".to_string()),
+        },
+    );
+    properties.insert(
+        "weight".to_string(),
+        JsonSchema::Number {
+            description: Some("Optional vote weight.".to_string()),
+        },
+    );
+    properties.insert(
+        "label".to_string(),
+        JsonSchema::String {
+            description: Some("Timer or artifact label.".to_string()),
+        },
+    );
+    properties.insert(
+        "duration_ms".to_string(),
+        JsonSchema::Number {
+            description: Some("Timer duration in milliseconds.".to_string()),
+        },
+    );
+    properties.insert(
+        "path".to_string(),
+        JsonSchema::String {
+            description: Some("Path for leak tracker storage.".to_string()),
+        },
+    );
+    properties.insert(
+        "load_existing".to_string(),
+        JsonSchema::Boolean {
+            description: Some("Load existing leak tracker file when setting path.".to_string()),
+        },
+    );
+    properties.insert(
+        "value".to_string(),
+        JsonSchema::String {
+            description: Some("Leak tracker value.".to_string()),
+        },
+    );
+    properties.insert(
+        "context".to_string(),
+        JsonSchema::String {
+            description: Some("Optional context for leak tracker entries.".to_string()),
+        },
+    );
+    properties.insert(
+        "severity".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional severity for leak tracker or evidence entries.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "title".to_string(),
+        JsonSchema::String {
+            description: Some("Task title.".to_string()),
+        },
+    );
+    properties.insert(
+        "status".to_string(),
+        JsonSchema::String {
+            description: Some("Task status.".to_string()),
+        },
+    );
+    properties.insert(
+        "notes".to_string(),
+        JsonSchema::String {
+            description: Some("Optional task notes.".to_string()),
+        },
+    );
+    properties.insert(
+        "summary".to_string(),
+        JsonSchema::String {
+            description: Some("Summary for evidence or decisions.".to_string()),
+        },
+    );
+    properties.insert(
+        "source".to_string(),
+        JsonSchema::String {
+            description: Some("Optional evidence source.".to_string()),
+        },
+    );
+    properties.insert(
+        "rationale".to_string(),
+        JsonSchema::String {
+            description: Some("Optional decision rationale.".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "swarm_hub".to_string(),
+        description: "Shared Swarm Hub for multi-agent coordination (lounge, timer, voting, leak tracker, tasks, evidence, decisions, artifacts)."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["action".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1407,6 +1565,9 @@ pub(crate) fn build_specs(
         builder.register_handler("send_input", collab_handler.clone());
         builder.register_handler("wait", collab_handler.clone());
         builder.register_handler("close_agent", collab_handler);
+        let swarm_hub_handler = Arc::new(SwarmHubHandler);
+        builder.push_spec(create_swarm_hub_tool());
+        builder.register_handler("swarm_hub", swarm_hub_handler);
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -1622,7 +1783,13 @@ mod tests {
         let (tools, _) = build_specs(&tools_config, None, &[]).build();
         assert_contains_tool_names(
             &tools,
-            &["spawn_agent", "send_input", "wait", "close_agent"],
+            &[
+                "spawn_agent",
+                "send_input",
+                "wait",
+                "close_agent",
+                "swarm_hub",
+            ],
         );
     }
 

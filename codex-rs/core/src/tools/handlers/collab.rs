@@ -1,11 +1,10 @@
 use crate::agent::AgentStatus;
-use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::error::CodexErr;
-use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
+use crate::swarm::SwarmRole;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -93,6 +92,7 @@ mod spawn {
     struct SpawnAgentArgs {
         message: String,
         agent_type: Option<AgentRole>,
+        swarm_role: Option<String>,
     }
 
     #[derive(Debug, Serialize)]
@@ -107,6 +107,11 @@ mod spawn {
         arguments: String,
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+        if args.agent_type.is_some() && args.swarm_role.is_some() {
+            return Err(FunctionCallError::RespondToModel(
+                "Specify only one of agent_type or swarm_role.".to_string(),
+            ));
+        }
         let agent_role = args.agent_type.unwrap_or(AgentRole::Default);
         let prompt = args.message;
         if prompt.trim().is_empty() {
@@ -114,11 +119,41 @@ mod spawn {
                 "Empty message can't be sent to an agent".to_string(),
             ));
         }
+        let base_config = turn.client.config();
+        let swarm_role_name = args.swarm_role.as_deref().or_else(|| {
+            if base_config.swarm.enabled {
+                base_config.swarm.default_spawn_role_name()
+            } else {
+                None
+            }
+        });
+        let swarm_role = swarm_role_name.and_then(|name| base_config.swarm.role(name));
+        if let Some(name) = swarm_role_name
+            && swarm_role.is_none()
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "Unknown swarm role '{name}'."
+            )));
+        }
+
         let session_source = turn.client.get_session_source();
         let child_depth = next_thread_spawn_depth(&session_source);
         if exceeds_thread_spawn_depth_limit(child_depth) {
             return Err(FunctionCallError::RespondToModel(
                 "Agent depth limit reached. Solve the task yourself.".to_string(),
+            ));
+        }
+        if base_config.swarm.enabled
+            && let Some(role) = swarm_role
+            && let Some(sender) = session
+                .services
+                .swarm_registry
+                .get(session.conversation_id)
+                .await
+            && !base_config.swarm.can_call(sender.tier, role.tier)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "Swarm hierarchy prevents spawning a higher-tier agent.".to_string(),
             ));
         }
         session
@@ -136,10 +171,12 @@ mod spawn {
             &session.get_base_instructions().await,
             turn.as_ref(),
             child_depth,
+            swarm_role,
         )?;
         agent_role
             .apply_to_config(&mut config)
             .map_err(FunctionCallError::RespondToModel)?;
+        let agent_model = config.model.clone();
 
         let result = session
             .services
@@ -175,6 +212,15 @@ mod spawn {
             )
             .await;
         let new_thread_id = result?;
+        if base_config.swarm.enabled
+            && let Some(role) = swarm_role
+        {
+            session
+                .services
+                .swarm_registry
+                .register_child(new_thread_id, session.conversation_id, role, agent_model)
+                .await;
+        }
 
         let content = serde_json::to_string(&SpawnAgentResult {
             agent_id: new_thread_id.to_string(),
@@ -221,6 +267,26 @@ mod send_input {
             return Err(FunctionCallError::RespondToModel(
                 "Empty message can't be sent to an agent".to_string(),
             ));
+        }
+        let base_config = turn.client.config();
+        if base_config.swarm.enabled {
+            if let (Some(sender), Some(receiver)) = (
+                session
+                    .services
+                    .swarm_registry
+                    .get(session.conversation_id)
+                    .await,
+                session
+                    .services
+                    .swarm_registry
+                    .get(receiver_thread_id)
+                    .await,
+            ) && !base_config.swarm.can_call(sender.tier, receiver.tier)
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "Swarm hierarchy prevents sending input to a higher-tier agent.".to_string(),
+                ));
+            }
         }
         if args.interrupt {
             session
@@ -487,6 +553,22 @@ pub mod close_agent {
     ) -> Result<ToolOutput, FunctionCallError> {
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
         let agent_id = agent_id(&args.id)?;
+        let base_config = turn.client.config();
+        if base_config.swarm.enabled {
+            if let (Some(sender), Some(receiver)) = (
+                session
+                    .services
+                    .swarm_registry
+                    .get(session.conversation_id)
+                    .await,
+                session.services.swarm_registry.get(agent_id).await,
+            ) && !base_config.swarm.can_call(sender.tier, receiver.tier)
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "Swarm hierarchy prevents closing a higher-tier agent.".to_string(),
+                ));
+            }
+        }
         session
             .send_event(
                 &turn,
@@ -591,12 +673,30 @@ fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionCallError {
 fn build_agent_spawn_config(
     base_instructions: &BaseInstructions,
     turn: &TurnContext,
-    child_depth: i32,
+    _child_depth: i32,
+    swarm_role: Option<&SwarmRole>,
 ) -> Result<Config, FunctionCallError> {
     let base_config = turn.client.config();
     let mut config = (*base_config).clone();
     config.base_instructions = Some(base_instructions.text.clone());
-    config.model = Some(turn.client.get_model());
+    if let Some(role) = swarm_role {
+        if let Some(model) = role.model.as_ref() {
+            config.model = Some(model.clone());
+        }
+        if let Some(role_instructions) = role.base_instructions.as_ref()
+            && !role_instructions.trim().is_empty()
+        {
+            config.base_instructions = Some(match config.base_instructions.as_ref() {
+                Some(current) if !current.trim().is_empty() => {
+                    format!("{current}\n\n{role_instructions}")
+                }
+                _ => role_instructions.clone(),
+            });
+        }
+    }
+    if config.model.is_none() {
+        config.model = Some(turn.client.get_model());
+    }
     config.model_provider = turn.client.get_provider();
     config.model_reasoning_effort = turn.client.get_reasoning_effort();
     config.model_reasoning_summary = turn.client.get_reasoning_summary();
@@ -617,11 +717,6 @@ fn build_agent_spawn_config(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("sandbox_policy is invalid: {err}"))
         })?;
-
-    // If the new agent will be at max depth:
-    if exceeds_thread_spawn_depth_limit(child_depth + 1) {
-        config.features.disable(Feature::Collab);
-    }
 
     Ok(config)
 }

@@ -29,6 +29,7 @@ pub enum SlashCommand {
     Plan,
     Collab,
     Agent,
+    Swarm,
     // Undo,
     Diff,
     Mention,
@@ -69,6 +70,7 @@ impl SlashCommand {
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Collab => "change collaboration mode (experimental)",
             SlashCommand::Agent => "switch the active agent thread",
+            SlashCommand::Swarm => "open the swarm dashboard",
             SlashCommand::Approvals => "choose what Codex can do without approval",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
@@ -109,6 +111,7 @@ impl SlashCommand {
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::Swarm
             | SlashCommand::Ps
             | SlashCommand::Mcp
             | SlashCommand::Apps
