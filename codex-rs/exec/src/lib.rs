@@ -420,6 +420,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
             (InitialOperation::Review { review_request }, summary)
         }
+        (Some(ExecCommand::Swarm(_)), _, _) => {
+            unreachable!("swarm command handled before initialization");
+        }
         (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
             let prompt_arg = args
                 .prompt
@@ -938,7 +941,7 @@ async fn run_swarm_command(
             let status = match thread_manager.subscribe_agent_status(agent_id).await {
                 Ok(mut status_rx) => status_rx.borrow_and_update().clone(),
                 Err(err) => {
-                    let status = thread_manager.agent_status(agent_id).await;
+                    thread_manager.agent_status(agent_id).await;
                     return Err(err.into());
                 }
             };
