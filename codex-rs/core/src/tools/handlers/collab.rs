@@ -1287,7 +1287,8 @@ mod tests {
         turn.approval_policy = AskForApproval::Never;
         turn.sandbox_policy = SandboxPolicy::DangerFullAccess;
 
-        let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
+        let config =
+            build_agent_spawn_config(&base_instructions, &turn, 0, None).expect("spawn config");
         let mut expected = (*turn.client.config()).clone();
         expected.base_instructions = Some(base_instructions.text);
         expected.model = Some(turn.client.get_model());
@@ -1334,7 +1335,8 @@ mod tests {
             text: "base".to_string(),
         };
 
-        let config = build_agent_spawn_config(&base_instructions, &turn, 0).expect("spawn config");
+        let config =
+            build_agent_spawn_config(&base_instructions, &turn, 0, None).expect("spawn config");
 
         assert_eq!(config.user_instructions, base_config.user_instructions);
     }

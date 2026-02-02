@@ -31,6 +31,7 @@ use crate::app::App;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::Overlay;
+use crate::pager_overlay::SwarmOverlay;
 use crate::tui;
 use crate::tui::TuiEvent;
 use codex_core::protocol::CodexErrorInfo;
@@ -392,7 +393,11 @@ impl App {
                 .is_some_and(|overlay| matches!(overlay, Overlay::Swarm(_)))
         {
             let width = tui.terminal.viewport_area.width.max(1);
-            let data = self.swarm_overlay_data(tui, width).await;
+            let layout = SwarmOverlay::layout_for_width(width);
+            let hub_width = layout.hub_width();
+            let data = self
+                .swarm_overlay_data(tui, layout.center_width, hub_width)
+                .await;
             if let Some(Overlay::Swarm(swarm)) = &mut self.overlay {
                 swarm.sync(data);
                 tui.draw(u16::MAX, |frame| {

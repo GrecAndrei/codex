@@ -28,6 +28,7 @@ use crate::render::Insets;
 use crate::render::renderable::InsetRenderable;
 use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
+use crate::text_formatting::truncate_text;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crossterm::event::KeyCode;
@@ -778,7 +779,25 @@ pub(crate) struct SwarmOverlayData {
     pub(crate) agents: Vec<SwarmAgentSnapshot>,
     pub(crate) hub_lines: Vec<Line<'static>>,
     pub(crate) version: u64,
-    pub(crate) width: u16,
+    pub(crate) center_width: u16,
+    pub(crate) hub_width: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SwarmOverlayLayout {
+    pub(crate) left_width: u16,
+    pub(crate) center_width: u16,
+    pub(crate) right_width: u16,
+}
+
+impl SwarmOverlayLayout {
+    pub(crate) fn hub_width(self) -> u16 {
+        if self.right_width > 0 {
+            self.right_width
+        } else {
+            self.center_width
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -815,27 +834,101 @@ impl SwarmTab {
 }
 
 pub(crate) struct SwarmOverlay {
-    view: PagerView,
+    renderables: Vec<Box<dyn Renderable>>,
     tab: SwarmTab,
     selected_agent: usize,
     agents: Vec<SwarmAgentSnapshot>,
     hub_lines: Vec<Line<'static>>,
     is_done: bool,
     last_version: u64,
-    last_width: u16,
+    last_center_width: u16,
+    last_hub_width: u16,
+    scroll_offset: usize,
+    last_content_height: Option<usize>,
+    last_rendered_height: Option<usize>,
+    pending_scroll_chunk: Option<usize>,
 }
 
 impl SwarmOverlay {
     pub(crate) fn new() -> Self {
         Self {
-            view: PagerView::new(Vec::new(), "S W A R M".to_string(), usize::MAX),
+            renderables: Vec::new(),
             tab: SwarmTab::All,
             selected_agent: 0,
             agents: Vec::new(),
             hub_lines: Vec::new(),
             is_done: false,
             last_version: 0,
-            last_width: 0,
+            last_center_width: 0,
+            last_hub_width: 0,
+            scroll_offset: usize::MAX,
+            last_content_height: None,
+            last_rendered_height: None,
+            pending_scroll_chunk: None,
+        }
+    }
+
+    pub(crate) fn layout_for_width(width: u16) -> SwarmOverlayLayout {
+        let width = width.max(1);
+        let min_left = 16u16;
+        let min_right = 20u16;
+        let min_center = 30u16;
+        let min_full = min_left + min_center + min_right + 2;
+
+        if width < min_left + min_center + 1 {
+            return SwarmOverlayLayout {
+                left_width: 0,
+                center_width: width,
+                right_width: 0,
+            };
+        }
+
+        if width < min_full {
+            let available = width.saturating_sub(1);
+            let mut left = (available.saturating_mul(25) / 100).max(min_left);
+            if left >= available {
+                left = available.saturating_sub(min_center);
+            }
+            let center = available.saturating_sub(left);
+            return SwarmOverlayLayout {
+                left_width: left,
+                center_width: center,
+                right_width: 0,
+            };
+        }
+
+        let available = width.saturating_sub(2);
+        let mut left = (available.saturating_mul(22) / 100).max(min_left);
+        let mut right = (available.saturating_mul(24) / 100).max(min_right);
+        if left.saturating_add(right) >= available {
+            right = available.saturating_sub(left);
+        }
+        let mut center = available.saturating_sub(left).saturating_sub(right);
+
+        if center < min_center {
+            let deficit = min_center.saturating_sub(center);
+            let right_room = right.saturating_sub(min_right);
+            let take_right = deficit.min(right_room);
+            right = right.saturating_sub(take_right);
+            center = center.saturating_add(take_right);
+
+            let remaining = deficit.saturating_sub(take_right);
+            if remaining > 0 {
+                let left_room = left.saturating_sub(min_left);
+                let take_left = remaining.min(left_room);
+                left = left.saturating_sub(take_left);
+                center = center.saturating_add(take_left);
+            }
+        }
+
+        if center == 0 {
+            center = available.saturating_sub(left).saturating_sub(right);
+        }
+
+        SwarmOverlayLayout {
+            left_width: left,
+            center_width: center,
+            right_width: right,
         }
     }
 
@@ -846,16 +939,19 @@ impl SwarmOverlay {
             self.selected_agent = self.agents.len().saturating_sub(1);
         }
 
-        let needs_rebuild = data.version != self.last_version || data.width != self.last_width;
+        let needs_rebuild = data.version != self.last_version
+            || data.center_width != self.last_center_width
+            || data.hub_width != self.last_hub_width;
         self.last_version = data.version;
-        self.last_width = data.width;
+        self.last_center_width = data.center_width;
+        self.last_hub_width = data.hub_width;
         if needs_rebuild {
             self.rebuild_renderables();
         }
     }
 
     fn rebuild_renderables(&mut self) {
-        self.view.renderables = match self.tab {
+        self.renderables = match self.tab {
             SwarmTab::All => self.build_all_renderables(),
             SwarmTab::Agent => self.build_agent_renderables(),
             SwarmTab::Hub => self.build_hub_renderables(),
@@ -893,7 +989,6 @@ impl SwarmOverlay {
 
     fn build_all_renderables(&self) -> Vec<Box<dyn Renderable>> {
         let mut renderables: Vec<Box<dyn Renderable>> = Vec::new();
-        renderables.push(Box::new(CachedRenderable::new(self.build_tabs_line())));
         for (idx, agent) in self.agents.iter().enumerate() {
             if idx > 0 {
                 renderables.push(Box::new(Line::from("")));
@@ -907,8 +1002,7 @@ impl SwarmOverlay {
     }
 
     fn build_agent_renderables(&self) -> Vec<Box<dyn Renderable>> {
-        let mut renderables: Vec<Box<dyn Renderable>> =
-            vec![Box::new(CachedRenderable::new(self.build_tabs_line()))];
+        let mut renderables: Vec<Box<dyn Renderable>> = Vec::new();
         if let Some(agent) = self.agents.get(self.selected_agent) {
             renderables.extend(self.build_agent_section(agent, true));
         } else {
@@ -918,8 +1012,7 @@ impl SwarmOverlay {
     }
 
     fn build_hub_renderables(&self) -> Vec<Box<dyn Renderable>> {
-        let mut renderables: Vec<Box<dyn Renderable>> =
-            vec![Box::new(CachedRenderable::new(self.build_tabs_line()))];
+        let mut renderables: Vec<Box<dyn Renderable>> = Vec::new();
         if self.hub_lines.is_empty() {
             renderables.push(Box::new(Line::from("Swarm Hub is empty.".dim())));
             return renderables;
@@ -1000,6 +1093,94 @@ impl SwarmOverlay {
         renderable
     }
 
+    fn agent_list_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+        if self.agents.is_empty() {
+            return vec![Line::from("No agents yet.".dim())];
+        }
+        let label_width = width.saturating_sub(2).max(1) as usize;
+        self.agents
+            .iter()
+            .enumerate()
+            .map(|(idx, agent)| {
+                let bullet = if agent.is_active { "●" } else { "○" };
+                let mut name = agent.name.clone();
+                if agent.is_active {
+                    name.push_str(" *");
+                }
+                let display = truncate_text(&name, label_width);
+                let mut style = Style::default().fg(agent.color);
+                if idx == self.selected_agent {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                let spans = vec![
+                    Span::styled(bullet, Style::default().fg(agent.color)),
+                    " ".into(),
+                    Span::styled(display, style),
+                ];
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    fn content_height(&self, width: u16) -> usize {
+        self.renderables
+            .iter()
+            .map(|c| c.desired_height(width) as usize)
+            .sum()
+    }
+
+    fn render_center_content(&mut self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.last_content_height = Some(area.height as usize);
+        let content_height = self.content_height(area.width);
+        self.last_rendered_height = Some(content_height);
+        if let Some(idx) = self.pending_scroll_chunk.take() {
+            self.ensure_chunk_visible(idx, area);
+        }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(content_height.saturating_sub(area.height as usize));
+
+        let mut y = -(self.scroll_offset as isize);
+        let mut drawn_bottom = area.y;
+        for renderable in &self.renderables {
+            let top = y;
+            let height = renderable.desired_height(area.width) as isize;
+            y += height;
+            let bottom = y;
+            if bottom < area.y as isize {
+                continue;
+            }
+            if top > area.y as isize + area.height as isize {
+                break;
+            }
+            if top < 0 {
+                let drawn = render_offset_content(area, buf, &**renderable, (-top) as u16);
+                drawn_bottom = drawn_bottom.max(area.y + drawn);
+            } else {
+                let draw_height = (height as u16).min(area.height.saturating_sub(top as u16));
+                let draw_area = Rect::new(area.x, area.y + top as u16, area.width, draw_height);
+                renderable.render(draw_area, buf);
+                drawn_bottom = drawn_bottom.max(draw_area.y.saturating_add(draw_area.height));
+            }
+        }
+
+        for y in drawn_bottom..area.bottom() {
+            if area.width == 0 {
+                break;
+            }
+            buf[(area.x, y)] = Cell::from('~');
+            for x in area.x + 1..area.right() {
+                buf[(x, y)] = Cell::from(' ');
+            }
+        }
+    }
+
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
@@ -1008,17 +1189,118 @@ impl SwarmOverlay {
             (&[KEY_Q, KEY_ESC], "to quit"),
             (&[KEY_TAB, KEY_SHIFT_TAB], "to switch tabs"),
         ];
-        if self.tab == SwarmTab::Agent {
-            pairs.push((&[KEY_BRACKET_LEFT, KEY_BRACKET_RIGHT], "agent prev/next"));
-        }
+        pairs.push((&[KEY_BRACKET_LEFT, KEY_BRACKET_RIGHT], "agent prev/next"));
         render_key_hints(line2, buf, &pairs);
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        Clear.render(area, buf);
         let top_h = area.height.saturating_sub(3);
         let top = Rect::new(area.x, area.y, area.width, top_h);
         let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
-        self.view.render(top, buf);
+
+        if top.height == 0 {
+            self.render_hints(bottom, buf);
+            return;
+        }
+
+        let tabs_area = Rect::new(top.x, top.y, top.width, 1);
+        let content_area = Rect::new(top.x, top.y + 1, top.width, top.height.saturating_sub(1));
+
+        Paragraph::new(self.build_tabs_line()).render_ref(tabs_area, buf);
+
+        if content_area.height == 0 {
+            self.render_hints(bottom, buf);
+            return;
+        }
+
+        let header_row = Rect::new(content_area.x, content_area.y, content_area.width, 1);
+        let body_row = Rect::new(
+            content_area.x,
+            content_area.y.saturating_add(1),
+            content_area.width,
+            content_area.height.saturating_sub(1),
+        );
+
+        let layout = Self::layout_for_width(content_area.width);
+        let mut cursor_x = content_area.x;
+        let left_rect = if layout.left_width > 0 {
+            let rect = Rect::new(cursor_x, body_row.y, layout.left_width, body_row.height);
+            cursor_x = cursor_x.saturating_add(layout.left_width);
+            Some(rect)
+        } else {
+            None
+        };
+        let left_sep_x = if layout.left_width > 0 && layout.center_width > 0 {
+            let sep_x = cursor_x;
+            cursor_x = cursor_x.saturating_add(1);
+            Some(sep_x)
+        } else {
+            None
+        };
+        let center_rect = if layout.center_width > 0 {
+            let rect = Rect::new(cursor_x, body_row.y, layout.center_width, body_row.height);
+            cursor_x = cursor_x.saturating_add(layout.center_width);
+            rect
+        } else {
+            Rect::new(cursor_x, body_row.y, 0, body_row.height)
+        };
+        let right_sep_x = if layout.right_width > 0 {
+            let sep_x = cursor_x;
+            cursor_x = cursor_x.saturating_add(1);
+            Some(sep_x)
+        } else {
+            None
+        };
+        let right_rect = if layout.right_width > 0 {
+            Some(Rect::new(
+                cursor_x,
+                body_row.y,
+                layout.right_width,
+                body_row.height,
+            ))
+        } else {
+            None
+        };
+
+        for sep_x in [left_sep_x, right_sep_x].iter().copied().flatten() {
+            for y in content_area.y..content_area.bottom() {
+                buf[(sep_x, y)] = Cell::from('│');
+            }
+        }
+
+        if let Some(left) = left_rect {
+            if header_row.height > 0 {
+                let header = Rect::new(left.x, header_row.y, left.width, header_row.height);
+                Paragraph::new(Line::from("Agents".bold())).render_ref(header, buf);
+            }
+            let lines = self.agent_list_lines(left.width);
+            let paragraph = Paragraph::new(Text::from(lines));
+            paragraph.render(left, buf);
+        }
+
+        if center_rect.width > 0 {
+            if header_row.height > 0 {
+                let header = Rect::new(center_rect.x, header_row.y, center_rect.width, 1);
+                let title = match self.tab {
+                    SwarmTab::All => "Transcript",
+                    SwarmTab::Agent => "Transcript",
+                    SwarmTab::Hub => "Hub",
+                };
+                Paragraph::new(Line::from(title.bold())).render_ref(header, buf);
+            }
+            self.render_center_content(center_rect, buf);
+        }
+
+        if let Some(right) = right_rect {
+            if header_row.height > 0 {
+                let header = Rect::new(right.x, header_row.y, right.width, 1);
+                Paragraph::new(Line::from("Hub Snapshot".bold())).render_ref(header, buf);
+            }
+            let paragraph = Paragraph::new(Text::from(self.hub_lines.clone()));
+            paragraph.render(right, buf);
+        }
+
         self.render_hints(bottom, buf);
     }
 
@@ -1028,7 +1310,7 @@ impl SwarmOverlay {
         } else {
             self.tab.prev()
         };
-        self.view.scroll_offset = usize::MAX;
+        self.scroll_offset = usize::MAX;
         self.rebuild_renderables();
     }
 
@@ -1043,10 +1325,115 @@ impl SwarmOverlay {
         } else {
             self.selected_agent = self.selected_agent.saturating_sub(1);
         }
-        self.view.scroll_offset = usize::MAX;
+        self.scroll_offset = usize::MAX;
         if self.tab == SwarmTab::Agent {
             self.rebuild_renderables();
         }
+    }
+
+    fn center_body_area(&self, viewport_area: Rect) -> Rect {
+        let top_h = viewport_area.height.saturating_sub(3);
+        if top_h <= 1 {
+            return Rect::new(viewport_area.x, viewport_area.y, 0, 0);
+        }
+        let content_area = Rect::new(
+            viewport_area.x,
+            viewport_area.y + 1,
+            viewport_area.width,
+            top_h.saturating_sub(1),
+        );
+        if content_area.height <= 1 {
+            return Rect::new(content_area.x, content_area.y, 0, 0);
+        }
+        let body_row = Rect::new(
+            content_area.x,
+            content_area.y.saturating_add(1),
+            content_area.width,
+            content_area.height.saturating_sub(1),
+        );
+        let layout = Self::layout_for_width(content_area.width);
+        let mut cursor_x = content_area.x;
+        if layout.left_width > 0 {
+            cursor_x = cursor_x.saturating_add(layout.left_width);
+            if layout.center_width > 0 {
+                cursor_x = cursor_x.saturating_add(1);
+            }
+        }
+        Rect::new(cursor_x, body_row.y, layout.center_width, body_row.height)
+    }
+
+    fn page_height(&self, viewport_area: Rect) -> usize {
+        self.last_content_height
+            .unwrap_or_else(|| self.center_body_area(viewport_area).height as usize)
+    }
+
+    fn ensure_chunk_visible(&mut self, idx: usize, area: Rect) {
+        if area.height == 0 || idx >= self.renderables.len() {
+            return;
+        }
+        let first = self
+            .renderables
+            .iter()
+            .take(idx)
+            .map(|r| r.desired_height(area.width) as usize)
+            .sum();
+        let last = first + self.renderables[idx].desired_height(area.width) as usize;
+        let current_top = self.scroll_offset;
+        let current_bottom = current_top.saturating_add(area.height.saturating_sub(1) as usize);
+        if first < current_top {
+            self.scroll_offset = first;
+        } else if last > current_bottom {
+            let shift = last.saturating_sub(area.height as usize);
+            self.scroll_offset = shift.min(last);
+        }
+    }
+
+    fn handle_scroll_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) -> Result<()> {
+        let mut handled = true;
+        match key_event {
+            e if KEY_UP.is_press(e) || KEY_K.is_press(e) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+            e if KEY_DOWN.is_press(e) || KEY_J.is_press(e) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+            }
+            e if KEY_PAGE_UP.is_press(e)
+                || KEY_SHIFT_SPACE.is_press(e)
+                || KEY_CTRL_B.is_press(e) =>
+            {
+                let page_height = self.page_height(tui.terminal.viewport_area);
+                self.scroll_offset = self.scroll_offset.saturating_sub(page_height);
+            }
+            e if KEY_PAGE_DOWN.is_press(e) || KEY_SPACE.is_press(e) || KEY_CTRL_F.is_press(e) => {
+                let page_height = self.page_height(tui.terminal.viewport_area);
+                self.scroll_offset = self.scroll_offset.saturating_add(page_height);
+            }
+            e if KEY_CTRL_D.is_press(e) => {
+                let area = self.center_body_area(tui.terminal.viewport_area);
+                let half_page = (area.height as usize).saturating_add(1) / 2;
+                self.scroll_offset = self.scroll_offset.saturating_add(half_page);
+            }
+            e if KEY_CTRL_U.is_press(e) => {
+                let area = self.center_body_area(tui.terminal.viewport_area);
+                let half_page = (area.height as usize).saturating_add(1) / 2;
+                self.scroll_offset = self.scroll_offset.saturating_sub(half_page);
+            }
+            e if KEY_HOME.is_press(e) => {
+                self.scroll_offset = 0;
+            }
+            e if KEY_END.is_press(e) => {
+                self.scroll_offset = usize::MAX;
+            }
+            _ => {
+                handled = false;
+            }
+        }
+
+        if handled {
+            tui.frame_requester()
+                .schedule_frame_in(Duration::from_millis(16));
+        }
+        Ok(())
     }
 }
 
@@ -1078,7 +1465,7 @@ impl SwarmOverlay {
                     tui.frame_requester().schedule_frame();
                     Ok(())
                 }
-                other => self.view.handle_key_event(tui, other),
+                other => self.handle_scroll_key_event(tui, other),
             },
             TuiEvent::Draw => {
                 tui.draw(u16::MAX, |frame| {

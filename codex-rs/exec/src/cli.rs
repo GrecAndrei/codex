@@ -108,6 +108,9 @@ pub enum Command {
 
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+
+    /// Manage swarm agents (spawn, send input, wait, close, list, status).
+    Swarm(SwarmCommand),
 }
 
 #[derive(Args, Debug)]
@@ -161,10 +164,120 @@ pub struct ResumeArgs {
     pub prompt: Option<String>,
 }
 
+#[derive(Debug, Args)]
+pub struct SwarmCommand {
+    /// Conversation/session id (UUID) or thread name. UUIDs take precedence if it parses.
+    /// If omitted, uses --last to pick the most recent recorded session.
+    #[arg(long = "session-id", value_name = "SESSION_ID")]
+    pub session_id: Option<String>,
+
+    /// Use the most recent recorded session (newest) without specifying an id.
+    #[arg(long = "last", default_value_t = false)]
+    pub last: bool,
+
+    /// Show all sessions (disables cwd filtering).
+    #[arg(long = "all", default_value_t = false)]
+    pub all: bool,
+
+    #[command(subcommand)]
+    pub action: SwarmAction,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum SwarmAction {
+    /// Spawn a new agent.
+    Spawn(SwarmSpawnArgs),
+    /// Send input to an agent.
+    Send(SwarmSendArgs),
+    /// Wait for agents to reach a final status.
+    Wait(SwarmWaitArgs),
+    /// Close an agent.
+    Close(SwarmCloseArgs),
+    /// Interrupt an agent.
+    Interrupt(SwarmInterruptArgs),
+    /// List swarm registry entries.
+    List(SwarmListArgs),
+    /// Show a single agent's status.
+    Status(SwarmStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SwarmSpawnArgs {
+    /// Initial task for the new agent.
+    #[arg(value_name = "MESSAGE", value_hint = clap::ValueHint::Other)]
+    pub message: String,
+
+    /// Optional agent type (default, explorer, worker, orchestrator).
+    #[arg(long = "agent-type", value_enum)]
+    pub agent_type: Option<AgentTypeArg>,
+
+    /// Optional swarm role name (configured in settings). Specify either swarm_role or agent_type.
+    #[arg(long = "swarm-role")]
+    pub swarm_role: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SwarmSendArgs {
+    /// Agent id to message (from spawn_agent).
+    #[arg(value_name = "AGENT_ID")]
+    pub id: String,
+
+    /// Message to send to the agent.
+    #[arg(value_name = "MESSAGE", value_hint = clap::ValueHint::Other)]
+    pub message: String,
+
+    /// When true, stop the agent's current task and handle this immediately.
+    #[arg(long = "interrupt", default_value_t = false)]
+    pub interrupt: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SwarmWaitArgs {
+    /// Agent ids to wait on. Pass multiple ids to wait for whichever finishes first.
+    #[arg(value_name = "AGENT_ID", num_args = 1.., value_delimiter = ',')]
+    pub ids: Vec<String>,
+
+    /// Optional timeout in milliseconds. Defaults to 30s.
+    #[arg(long = "timeout-ms")]
+    pub timeout_ms: Option<i64>,
+}
+
+#[derive(Args, Debug)]
+pub struct SwarmCloseArgs {
+    /// Agent id to close.
+    #[arg(value_name = "AGENT_ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SwarmInterruptArgs {
+    /// Agent id to interrupt.
+    #[arg(value_name = "AGENT_ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct SwarmListArgs {}
+
+#[derive(Args, Debug)]
+pub struct SwarmStatusArgs {
+    /// Agent id to check.
+    #[arg(value_name = "AGENT_ID")]
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AgentTypeArg {
+    Default,
+    Explorer,
+    Worker,
+    Orchestrator,
+}
+
 impl From<ResumeArgsRaw> for ResumeArgs {
     fn from(raw: ResumeArgsRaw) -> Self {
         // When --last is used without an explicit prompt, treat the positional as the prompt
-        // (clap can’t express this conditional positional meaning cleanly).
+        // (clap can't express this conditional positional meaning cleanly).
         let (session_id, prompt) = if raw.last && raw.prompt.is_none() {
             (None, raw.session_id)
         } else {

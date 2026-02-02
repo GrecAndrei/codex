@@ -1,6 +1,6 @@
 Swarm multi-agent plan (draft)
 
-Status: Core config/runtime + Swarm Hub tool implemented; TUI full-screen swarm dashboard overlay in progress; settings/CLI/exec wiring pending.
+Status: Core config/runtime + Swarm Hub tool implemented; TUI swarm dashboard overlay in three-column layout + settings popup wired; persistence for hub/registry in progress; exec swarm commands implemented; CLI wiring in progress.
 
 Goals
 - Full multi-agent support across TUI, CLI, and exec.
@@ -21,6 +21,8 @@ Core features to implement
 - Inter-agent routing: allow send_input between any agents with hierarchy rule.
 - Collab tool behavior: keep spawn limits, but do not block messaging for sub-agents.
 - Persistence: swarm metadata and hub state survive resume.
+  - Store hub + registry under configured storage dir (or codex_home/swarm fallback).
+  - Leak tracker path remains LLM-managed and persists across sessions.
 
 Swarm Hub tools (native)
 - Timer: context-aware time allocation, start/stop, reminders.
@@ -37,11 +39,14 @@ Swarm Hub tools (native)
 UI scope (based on actual TUI architecture; full-screen view requested)
 - TUI: full-screen Swarm Dashboard overlay (new `/swarm` command).
   - Tabs: All agents, per-agent, and Hub.
-  - All-agents view shows messages + tool use using the same HistoryCell rendering as the main chat.
+  - All-agents view shows messages + tool use using the same HistoryCell rendering as the main chat, color-coded by agent.
   - Per-agent view mirrors the single-agent transcript output, color-coded by agent.
   - Hub view renders lounge, timer, votes, leak tracker, tasks, evidence, decisions, artifacts.
+- Layout choice: three-column view with Agents list (left), Transcript (center), Hub snapshot (right).
+- TUI: Swarm Settings popup (new `/swarm-settings` command) for enable/disable, root role, default spawn role, leak tracker path, storage dir.
 - CLI: codex agent spawn/list/send/wait/close.
 - Exec: agent and swarm flags for automation.
+- Exec: `swarm` command supports spawn/send/wait/close/list/status/interrupt.
 - Settings: Swarm section that configures roles, models, prompts, hub settings.
 
 Notes

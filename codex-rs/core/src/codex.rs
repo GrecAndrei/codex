@@ -774,6 +774,15 @@ impl Session {
             ),
         };
         swarm_hub.apply_config(&config.swarm.hub).await;
+        swarm_registry
+            .apply_storage_dir(config.swarm.hub.storage_dir.clone())
+            .await;
+        if let Err(err) = swarm_hub.load_from_storage().await {
+            warn!("Failed to load swarm hub state: {err}");
+        }
+        if let Err(err) = swarm_registry.load_from_storage().await {
+            warn!("Failed to load swarm registry state: {err}");
+        }
         if config.swarm.enabled
             && let Some(root_role) = config.swarm.root_role_name()
             && let Some(role) = config.swarm.role(root_role)
@@ -927,10 +936,6 @@ impl Session {
             };
         session_configuration.thread_name = thread_name.clone();
         let state = SessionState::new(session_configuration.clone());
-
-        let swarm_hub = SwarmHub::new(config.codex_home.clone());
-        swarm_hub.apply_config(&config.swarm.hub).await;
-        let swarm_registry = SwarmRegistry::new();
 
         let services = SessionServices {
             mcp_connection_manager: Arc::new(RwLock::new(McpConnectionManager::default())),
@@ -5339,6 +5344,8 @@ mod tests {
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
+        let swarm_hub = SwarmHub::new(config.codex_home.clone());
+        let swarm_registry = SwarmRegistry::new(config.codex_home.clone());
         let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);
@@ -5461,6 +5468,8 @@ mod tests {
         ));
         let agent_control = AgentControl::default();
         let exec_policy = ExecPolicyManager::default();
+        let swarm_hub = SwarmHub::new(config.codex_home.clone());
+        let swarm_registry = SwarmRegistry::new(config.codex_home.clone());
         let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
         let model = ModelsManager::get_model_offline(config.model.as_deref());
         let model_info = ModelsManager::construct_model_info_offline(model.as_str(), &config);

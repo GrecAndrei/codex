@@ -108,6 +108,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
+use toml_edit::value;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -968,6 +969,66 @@ impl App {
         tui.frame_requester().schedule_frame();
     }
 
+    async fn ensure_swarm_root_registered(&mut self) {
+        if !self.config.swarm.enabled {
+            return;
+        }
+        let Some(thread_id) = self.primary_thread_id.or(self.active_thread_id) else {
+            return;
+        };
+        let Some(root_role) = self.config.swarm.root_role_name() else {
+            return;
+        };
+        let Some(role) = self.config.swarm.role(root_role) else {
+            self.chat_widget.add_error_message(format!(
+                "Swarm root role '{root_role}' is not defined in config."
+            ));
+            return;
+        };
+        let model = match self.server.get_thread(thread_id).await {
+            Ok(thread) => Some(thread.config_snapshot().await.model),
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to resolve swarm root model: {err}"));
+                None
+            }
+        };
+        self.server
+            .swarm_registry()
+            .register_root(thread_id, role, model)
+            .await;
+    }
+
+    async fn sync_swarm_storage(&mut self) {
+        let hub = self.server.swarm_hub();
+        hub.apply_config(&self.config.swarm.hub).await;
+        if let Err(err) = hub.persist_now().await {
+            self.chat_widget.add_error_message(format!(
+                "Failed to persist swarm hub storage settings: {err}"
+            ));
+        }
+        let registry = self.server.swarm_registry();
+        registry
+            .apply_storage_dir(self.config.swarm.hub.storage_dir.clone())
+            .await;
+        if let Err(err) = registry.persist_now().await {
+            self.chat_widget.add_error_message(format!(
+                "Failed to persist swarm registry storage settings: {err}"
+            ));
+        }
+    }
+
+    async fn sync_swarm_leak_tracker_path(&mut self, path: Option<PathBuf>) {
+        let hub = self.server.swarm_hub();
+        hub.apply_config(&self.config.swarm.hub).await;
+        if let Some(path) = path {
+            hub.leak_tracker_set_path(path, true).await;
+        } else if let Err(err) = hub.persist_now().await {
+            self.chat_widget
+                .add_error_message(format!("Failed to persist swarm hub settings: {err}"));
+        }
+    }
+
     async fn select_agent_thread(&mut self, tui: &mut tui::Tui, thread_id: ThreadId) -> Result<()> {
         if self.active_thread_id == Some(thread_id) {
             return Ok(());
@@ -1098,7 +1159,8 @@ impl App {
     pub(crate) async fn swarm_overlay_data(
         &mut self,
         tui: &tui::Tui,
-        width: u16,
+        center_width: u16,
+        hub_width: u16,
     ) -> SwarmOverlayData {
         let registry = self.server.swarm_registry().snapshot().await;
         let mut registry_map: HashMap<ThreadId, SwarmAgentInfo> = HashMap::new();
@@ -1190,7 +1252,7 @@ impl App {
                 .and_then(|key| {
                     transcript
                         .widget
-                        .active_cell_transcript_lines(width)
+                        .active_cell_transcript_lines(center_width)
                         .map(|lines| SwarmActiveTail {
                             lines,
                             is_stream_continuation: key.is_stream_continuation,
@@ -1217,13 +1279,14 @@ impl App {
             None
         };
         self.swarm_transcripts.update_hub_state(hub_state.as_ref());
-        let hub_lines = build_swarm_hub_lines(hub_state.as_ref(), width);
+        let hub_lines = build_swarm_hub_lines(hub_state.as_ref(), hub_width);
 
         SwarmOverlayData {
             agents,
             hub_lines,
             version: self.swarm_transcripts.version,
-            width,
+            center_width,
+            hub_width,
         }
     }
 
@@ -2291,6 +2354,152 @@ impl App {
                     }
                 }
             }
+            AppEvent::UpdateSwarmEnabled(enabled) => {
+                let edit = ConfigEdit::SetPath {
+                    segments: vec!["swarm".to_string(), "enabled".to_string()],
+                    value: value(enabled),
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(self.active_profile.as_deref())
+                    .with_edits(vec![edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist swarm enabled state");
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to update swarm enabled setting: {err}"
+                    ));
+                } else {
+                    self.config.swarm.enabled = enabled;
+                    self.chat_widget
+                        .update_swarm_config(self.config.swarm.clone());
+                    self.ensure_swarm_root_registered().await;
+                }
+            }
+            AppEvent::UpdateSwarmRootRole(role) => {
+                let edit = match role.as_ref() {
+                    Some(role_value) => ConfigEdit::SetPath {
+                        segments: vec!["swarm".to_string(), "rootRole".to_string()],
+                        value: value(role_value.clone()),
+                    },
+                    None => ConfigEdit::ClearPath {
+                        segments: vec!["swarm".to_string(), "rootRole".to_string()],
+                    },
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(self.active_profile.as_deref())
+                    .with_edits(vec![edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist swarm root role");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to update swarm root role: {err}"));
+                } else {
+                    self.config.swarm.root_role = role;
+                    self.chat_widget
+                        .update_swarm_config(self.config.swarm.clone());
+                    self.ensure_swarm_root_registered().await;
+                }
+            }
+            AppEvent::UpdateSwarmDefaultSpawnRole(role) => {
+                let edit = match role.as_ref() {
+                    Some(role_value) => ConfigEdit::SetPath {
+                        segments: vec!["swarm".to_string(), "defaultSpawnRole".to_string()],
+                        value: value(role_value.clone()),
+                    },
+                    None => ConfigEdit::ClearPath {
+                        segments: vec!["swarm".to_string(), "defaultSpawnRole".to_string()],
+                    },
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(self.active_profile.as_deref())
+                    .with_edits(vec![edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist swarm default spawn role");
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to update swarm default spawn role: {err}"
+                    ));
+                } else {
+                    self.config.swarm.default_spawn_role = role;
+                    self.chat_widget
+                        .update_swarm_config(self.config.swarm.clone());
+                }
+            }
+            AppEvent::UpdateSwarmLeakTrackerPath(path) => {
+                let edit = match path.as_ref() {
+                    Some(path_value) => ConfigEdit::SetPath {
+                        segments: vec![
+                            "swarm".to_string(),
+                            "hub".to_string(),
+                            "leakTrackerPath".to_string(),
+                        ],
+                        value: value(path_value.display().to_string()),
+                    },
+                    None => ConfigEdit::ClearPath {
+                        segments: vec![
+                            "swarm".to_string(),
+                            "hub".to_string(),
+                            "leakTrackerPath".to_string(),
+                        ],
+                    },
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(self.active_profile.as_deref())
+                    .with_edits(vec![edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist swarm leak tracker path");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to update leak tracker path: {err}"));
+                } else {
+                    self.config.swarm.hub.leak_tracker_path = path;
+                    self.chat_widget
+                        .update_swarm_config(self.config.swarm.clone());
+                    self.sync_swarm_leak_tracker_path(
+                        self.config.swarm.hub.leak_tracker_path.clone(),
+                    )
+                    .await;
+                }
+            }
+            AppEvent::UpdateSwarmStorageDir(path) => {
+                let edit = match path.as_ref() {
+                    Some(path_value) => ConfigEdit::SetPath {
+                        segments: vec![
+                            "swarm".to_string(),
+                            "hub".to_string(),
+                            "storageDir".to_string(),
+                        ],
+                        value: value(path_value.display().to_string()),
+                    },
+                    None => ConfigEdit::ClearPath {
+                        segments: vec![
+                            "swarm".to_string(),
+                            "hub".to_string(),
+                            "storageDir".to_string(),
+                        ],
+                    },
+                };
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(self.active_profile.as_deref())
+                    .with_edits(vec![edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist swarm storage dir");
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to update swarm storage directory: {err}"
+                    ));
+                } else {
+                    self.config.swarm.hub.storage_dir = path;
+                    self.chat_widget
+                        .update_swarm_config(self.config.swarm.clone());
+                    self.sync_swarm_storage().await;
+                }
+            }
             AppEvent::UpdateFeatureFlags { updates } => {
                 if updates.is_empty() {
                     return Ok(AppRunControl::Continue);
@@ -2435,6 +2644,12 @@ impl App {
             }
             AppEvent::OpenSwarmDashboard => {
                 self.open_swarm_dashboard(tui);
+            }
+            AppEvent::OpenSwarmSettingsPopup => {
+                self.chat_widget.open_swarm_settings_popup();
+            }
+            AppEvent::OpenSwarmSettingsPrompt(field) => {
+                self.chat_widget.open_swarm_settings_prompt(field);
             }
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread(tui, thread_id).await?;
@@ -2854,7 +3069,7 @@ fn format_thread_label(thread_id: ThreadId) -> String {
 
 fn build_swarm_hub_lines(hub_state: Option<&SwarmHubState>, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let width = width.max(24) as usize;
+    let width = width.max(1) as usize;
     let Some(hub_state) = hub_state else {
         lines.push(Line::from("Swarm Hub disabled.".dim()));
         return lines;

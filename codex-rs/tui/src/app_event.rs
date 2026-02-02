@@ -41,6 +41,14 @@ pub(crate) enum WindowsSandboxFallbackReason {
     ElevationFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwarmSettingsField {
+    RootRole,
+    DefaultSpawnRole,
+    LeakTrackerPath,
+    StorageDir,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
@@ -54,6 +62,10 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Open the swarm dashboard overlay.
     OpenSwarmDashboard,
+    /// Open the swarm settings popup.
+    OpenSwarmSettingsPopup,
+    /// Open a swarm settings prompt for a specific field.
+    OpenSwarmSettingsPrompt(SwarmSettingsField),
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
 
@@ -129,6 +141,17 @@ pub(crate) enum AppEvent {
 
     /// Update the current personality in the running app and widget.
     UpdatePersonality(Personality),
+
+    /// Update swarm enabled flag in config.
+    UpdateSwarmEnabled(bool),
+    /// Update swarm root role in config (None clears to default).
+    UpdateSwarmRootRole(Option<String>),
+    /// Update swarm default spawn role in config (None clears to default).
+    UpdateSwarmDefaultSpawnRole(Option<String>),
+    /// Update swarm leak tracker path in config (None clears to default).
+    UpdateSwarmLeakTrackerPath(Option<PathBuf>),
+    /// Update swarm storage directory in config (None clears to default).
+    UpdateSwarmStorageDir(Option<PathBuf>),
 
     /// Persist the selected model and reasoning effort to the appropriate config.
     PersistModelSelection {

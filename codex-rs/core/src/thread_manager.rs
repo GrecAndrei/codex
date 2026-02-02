@@ -4,6 +4,8 @@ use crate::CodexAuth;
 #[cfg(any(test, feature = "test-support"))]
 use crate::ModelProviderInfo;
 use crate::agent::AgentControl;
+use crate::agent::exceeds_thread_spawn_depth_limit;
+use crate::agent::next_thread_spawn_depth;
 use crate::codex::Codex;
 use crate::codex::CodexSpawnOk;
 use crate::codex::INITIAL_SUBMIT_ID;
@@ -23,11 +25,13 @@ use crate::swarm::SwarmRegistry;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +39,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
@@ -90,7 +95,7 @@ impl ThreadManager {
                 )),
                 skills_manager: Arc::new(SkillsManager::new(codex_home.clone())),
                 swarm_hub: SwarmHub::new(codex_home.clone()),
-                swarm_registry: SwarmRegistry::new(),
+                swarm_registry: SwarmRegistry::new(codex_home.clone()),
                 auth_manager,
                 session_source,
                 #[cfg(any(test, feature = "test-support"))]
@@ -133,7 +138,7 @@ impl ThreadManager {
                 )),
                 skills_manager: Arc::new(SkillsManager::new(codex_home.clone())),
                 swarm_hub: SwarmHub::new(codex_home.clone()),
-                swarm_registry: SwarmRegistry::new(),
+                swarm_registry: SwarmRegistry::new(codex_home.clone()),
                 auth_manager,
                 session_source: SessionSource::Exec,
                 #[cfg(any(test, feature = "test-support"))]
@@ -300,6 +305,62 @@ impl ThreadManager {
 
     pub(crate) fn agent_control(&self) -> AgentControl {
         AgentControl::new(Arc::downgrade(&self.state))
+    }
+
+    /// Spawn a sub-agent from the provided parent thread id.
+    pub async fn spawn_agent_from_thread(
+        &self,
+        parent_thread_id: ThreadId,
+        config: Config,
+        prompt: String,
+    ) -> CodexResult<ThreadId> {
+        let thread = self.state.get_thread(parent_thread_id).await?;
+        let snapshot = thread.config_snapshot().await;
+        let child_depth = next_thread_spawn_depth(&snapshot.session_source);
+        if exceeds_thread_spawn_depth_limit(child_depth) {
+            return Err(CodexErr::UnsupportedOperation(
+                "Agent depth limit reached. Solve the task yourself.".to_string(),
+            ));
+        }
+        let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: child_depth,
+        });
+        self.agent_control()
+            .spawn_agent(config, prompt, Some(session_source))
+            .await
+    }
+
+    /// Send a prompt to an existing agent thread.
+    pub async fn send_agent_prompt(
+        &self,
+        agent_id: ThreadId,
+        prompt: String,
+    ) -> CodexResult<String> {
+        self.agent_control().send_prompt(agent_id, prompt).await
+    }
+
+    /// Interrupt the current task for an existing agent thread.
+    pub async fn interrupt_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+        self.agent_control().interrupt_agent(agent_id).await
+    }
+
+    /// Shutdown an existing agent thread.
+    pub async fn shutdown_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+        self.agent_control().shutdown_agent(agent_id).await
+    }
+
+    /// Fetch the last known status for an agent.
+    pub async fn agent_status(&self, agent_id: ThreadId) -> AgentStatus {
+        self.agent_control().get_status(agent_id).await
+    }
+
+    /// Subscribe to status updates for an agent.
+    pub async fn subscribe_agent_status(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<watch::Receiver<AgentStatus>> {
+        self.agent_control().subscribe_status(agent_id).await
     }
 
     #[cfg(any(test, feature = "test-support"))]

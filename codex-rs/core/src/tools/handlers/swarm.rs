@@ -1,3 +1,4 @@
+use crate::codex::Session;
 use crate::function_tool::FunctionCallError;
 use crate::swarm::SwarmArtifactEntry;
 use crate::swarm::SwarmDecisionEntry;
@@ -178,9 +179,20 @@ impl ToolHandler for SwarmHubHandler {
                     .ok_or_else(|| {
                         FunctionCallError::RespondToModel("vote_id not found".to_string())
                     })?;
+                let weight = match weight {
+                    Some(weight) => {
+                        if weight <= 0 {
+                            return Err(FunctionCallError::RespondToModel(
+                                "vote weight must be positive".to_string(),
+                            ));
+                        }
+                        weight
+                    }
+                    None => default_vote_weight(&session).await,
+                };
                 vote.votes.push(SwarmVoteCast {
                     option,
-                    weight: weight.unwrap_or(1),
+                    weight,
                     voter_thread_id: thread_id_string(Some(session.conversation_id)),
                 });
                 session.services.swarm_hub.upsert_vote(vote.clone()).await;
@@ -384,6 +396,22 @@ impl ToolHandler for SwarmHubHandler {
                 Ok(tool_ok(json!({ "artifacts": artifacts })))
             }
         }
+    }
+}
+
+async fn default_vote_weight(session: &Session) -> i32 {
+    let Some(info) = session
+        .services
+        .swarm_registry
+        .get(session.conversation_id)
+        .await
+    else {
+        return 1;
+    };
+    if info.role.eq_ignore_ascii_case("scholar") || info.tier >= 2 {
+        2
+    } else {
+        1
     }
 }
 

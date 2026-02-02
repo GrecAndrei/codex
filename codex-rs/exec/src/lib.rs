@@ -13,10 +13,12 @@ pub mod exec_events;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
+pub use cli::SwarmCommand;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_common::oss::ensure_oss_provider_ready;
 use codex_common::oss::get_default_model_for_oss_provider;
 use codex_common::oss::ollama_chat_deprecation_notice;
+use codex_core::AgentRole;
 use codex_core::AuthManager;
 use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::NewThread;
@@ -41,13 +43,17 @@ use codex_core::protocol::Op;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SessionSource;
+use codex_core::swarm::SwarmAgentInfo;
+use codex_core::swarm::SwarmRole;
 use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -55,6 +61,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use supports_color::Stream;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -63,7 +71,9 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
+use crate::cli::AgentTypeArg;
 use crate::cli::Command as ExecCommand;
+use crate::cli::SwarmAction;
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use codex_core::default_client::set_default_client_residency_requirement;
@@ -368,6 +378,22 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         .get_default_model(&config.model, &config, RefreshStrategy::OnlineIfUncached)
         .await;
 
+    let command = match command {
+        Some(ExecCommand::Swarm(swarm_cmd)) => {
+            run_swarm_command(
+                swarm_cmd,
+                Arc::clone(&thread_manager),
+                Arc::clone(&auth_manager),
+                config.clone(),
+                default_model.clone(),
+                json_mode,
+            )
+            .await?;
+            return Ok(());
+        }
+        other => other,
+    };
+
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewThread {
         thread_id: primary_thread_id,
@@ -650,6 +676,516 @@ async fn resolve_resume_path(
     } else {
         Ok(None)
     }
+}
+
+/// Minimum wait timeout to prevent tight polling loops from burning CPU.
+const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+const MAX_WAIT_TIMEOUT_MS: i64 = 300_000;
+
+#[derive(Debug, Serialize)]
+struct SwarmSpawnOutput {
+    agent_id: String,
+    status: AgentStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmSendOutput {
+    submission_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmWaitOutput {
+    status: HashMap<String, AgentStatus>,
+    timed_out: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmCloseOutput {
+    status: AgentStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmStatusOutput {
+    status: AgentStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmListOutput {
+    agents: Vec<SwarmAgentInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmInterruptOutput {
+    submission_id: String,
+}
+
+async fn run_swarm_command(
+    command: SwarmCommand,
+    thread_manager: Arc<ThreadManager>,
+    auth_manager: Arc<AuthManager>,
+    config: Config,
+    default_model: String,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    let SwarmCommand {
+        session_id,
+        last,
+        all,
+        action,
+    } = command;
+
+    let registry = thread_manager.swarm_registry();
+    registry
+        .apply_storage_dir(config.swarm.hub.storage_dir.clone())
+        .await;
+    if let Err(err) = registry.load_from_storage().await {
+        warn!("Failed to load swarm registry state: {err}");
+    }
+
+    let sender_thread_id = match action {
+        SwarmAction::List(_) => None,
+        _ => Some(
+            resolve_swarm_sender_thread(
+                &config,
+                session_id.as_deref(),
+                last,
+                all,
+                &thread_manager,
+                &auth_manager,
+            )
+            .await?,
+        ),
+    };
+
+    match action {
+        SwarmAction::List(_) => {
+            let agents = registry.snapshot().await;
+            emit_swarm_output(json_mode, SwarmListOutput { agents }, |output| {
+                if output.agents.is_empty() {
+                    return "No agents in registry.".to_string();
+                }
+                let mut lines = Vec::new();
+                for agent in &output.agents {
+                    let parent = agent
+                        .parent_thread_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let model = agent.model.as_deref().unwrap_or("-");
+                    lines.push(format!(
+                        "{}  role={}  model={}  tier={}  parent={parent}",
+                        agent.thread_id, agent.role, model, agent.tier
+                    ));
+                }
+                lines.join("\n")
+            })?;
+        }
+        SwarmAction::Spawn(args) => {
+            if args.agent_type.is_some() && args.swarm_role.is_some() {
+                anyhow::bail!("Specify only one of --agent-type or --swarm-role.");
+            }
+            let sender_thread_id = sender_thread_id.expect("sender thread id required");
+            let prompt = resolve_prompt(Some(args.message));
+            if prompt.trim().is_empty() {
+                anyhow::bail!("Empty message can't be sent to an agent.");
+            }
+
+            let swarm_role_name = args.swarm_role.as_deref().or_else(|| {
+                if config.swarm.enabled {
+                    config.swarm.default_spawn_role_name()
+                } else {
+                    None
+                }
+            });
+            let swarm_role = swarm_role_name.and_then(|name| config.swarm.role(name));
+            if let Some(name) = swarm_role_name
+                && swarm_role.is_none()
+            {
+                anyhow::bail!("Unknown swarm role '{name}'.");
+            }
+            if config.swarm.enabled
+                && let Some(role) = swarm_role
+                && let Some(sender) = registry.get(sender_thread_id).await
+                && !config.swarm.can_call(sender.tier, role.tier)
+            {
+                anyhow::bail!("Swarm hierarchy prevents spawning a higher-tier agent.");
+            }
+
+            let agent_role = args.agent_type.map(agent_role_from_arg);
+            let spawn_config =
+                build_spawn_config(config.clone(), &default_model, swarm_role, agent_role)?;
+            let agent_model = spawn_config.model.clone();
+            let new_thread_id = thread_manager
+                .spawn_agent_from_thread(sender_thread_id, spawn_config, prompt)
+                .await?;
+            if config.swarm.enabled
+                && let Some(role) = swarm_role
+            {
+                registry
+                    .register_child(new_thread_id, sender_thread_id, role, agent_model)
+                    .await;
+            }
+            let status = thread_manager.agent_status(new_thread_id).await;
+            emit_swarm_output(
+                json_mode,
+                SwarmSpawnOutput {
+                    agent_id: new_thread_id.to_string(),
+                    status: status.clone(),
+                },
+                |_| format!("spawned {new_thread_id} ({})", format_agent_status(&status)),
+            )?;
+        }
+        SwarmAction::Send(args) => {
+            let sender_thread_id = sender_thread_id.expect("sender thread id required");
+            let receiver_thread_id = parse_thread_id(&args.id)?;
+            if args.message.trim().is_empty() {
+                anyhow::bail!("Empty message can't be sent to an agent.");
+            }
+            if config.swarm.enabled {
+                if let (Some(sender), Some(receiver)) = (
+                    registry.get(sender_thread_id).await,
+                    registry.get(receiver_thread_id).await,
+                ) && !config.swarm.can_call(sender.tier, receiver.tier)
+                {
+                    anyhow::bail!("Swarm hierarchy prevents sending input to a higher-tier agent.");
+                }
+            }
+            if args.interrupt {
+                let _ = thread_manager.interrupt_agent(receiver_thread_id).await?;
+            }
+            let prompt = resolve_prompt(Some(args.message));
+            let submission_id = thread_manager
+                .send_agent_prompt(receiver_thread_id, prompt)
+                .await?;
+            emit_swarm_output(json_mode, SwarmSendOutput { submission_id }, |output| {
+                format!("submission_id={}", output.submission_id)
+            })?;
+        }
+        SwarmAction::Wait(args) => {
+            let timeout_ms = resolve_wait_timeout(args.timeout_ms)?;
+            let ids = args
+                .ids
+                .iter()
+                .map(|id| parse_thread_id(id))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if ids.is_empty() {
+                anyhow::bail!("Must provide at least one agent id.");
+            }
+
+            let mut status_rxs = Vec::with_capacity(ids.len());
+            let mut initial_final_statuses = Vec::new();
+            for id in &ids {
+                match thread_manager.subscribe_agent_status(*id).await {
+                    Ok(rx) => {
+                        let status = rx.borrow().clone();
+                        if is_final_status(&status) {
+                            initial_final_statuses.push((*id, status));
+                        }
+                        status_rxs.push((*id, rx));
+                    }
+                    Err(codex_core::error::CodexErr::ThreadNotFound(_)) => {
+                        initial_final_statuses.push((*id, AgentStatus::NotFound));
+                    }
+                    Err(err) => {
+                        return Err(err.into());
+                    }
+                }
+            }
+
+            let statuses = if !initial_final_statuses.is_empty() {
+                initial_final_statuses
+            } else {
+                let mut join_set = JoinSet::new();
+                for (id, rx) in status_rxs.into_iter() {
+                    let manager = Arc::clone(&thread_manager);
+                    join_set.spawn(wait_for_final_status(manager, id, rx));
+                }
+                let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+                match tokio::time::timeout_at(deadline, join_set.join_next()).await {
+                    Ok(Some(Ok(Some(result)))) => vec![result],
+                    _ => Vec::new(),
+                }
+            };
+
+            let mut status_map = HashMap::new();
+            for (thread_id, status) in statuses {
+                status_map.insert(thread_id.to_string(), status);
+            }
+            let timed_out = status_map.is_empty();
+            emit_swarm_output(
+                json_mode,
+                SwarmWaitOutput {
+                    status: status_map.clone(),
+                    timed_out,
+                },
+                |_| format_wait_output(&status_map, timed_out),
+            )?;
+        }
+        SwarmAction::Close(args) => {
+            let sender_thread_id = sender_thread_id.expect("sender thread id required");
+            let agent_id = parse_thread_id(&args.id)?;
+            if config.swarm.enabled {
+                if let (Some(sender), Some(receiver)) = (
+                    registry.get(sender_thread_id).await,
+                    registry.get(agent_id).await,
+                ) && !config.swarm.can_call(sender.tier, receiver.tier)
+                {
+                    anyhow::bail!("Swarm hierarchy prevents closing a higher-tier agent.");
+                }
+            }
+            let status = match thread_manager.subscribe_agent_status(agent_id).await {
+                Ok(mut status_rx) => status_rx.borrow_and_update().clone(),
+                Err(err) => {
+                    let status = thread_manager.agent_status(agent_id).await;
+                    return Err(err.into());
+                }
+            };
+            if !matches!(status, AgentStatus::Shutdown) {
+                let _ = thread_manager.shutdown_agent(agent_id).await?;
+            }
+            emit_swarm_output(
+                json_mode,
+                SwarmCloseOutput {
+                    status: status.clone(),
+                },
+                |_| format!("closed {agent_id} ({})", format_agent_status(&status)),
+            )?;
+        }
+        SwarmAction::Interrupt(args) => {
+            let agent_id = parse_thread_id(&args.id)?;
+            let submission_id = thread_manager.interrupt_agent(agent_id).await?;
+            emit_swarm_output(
+                json_mode,
+                SwarmInterruptOutput { submission_id },
+                |output| format!("submission_id={}", output.submission_id),
+            )?;
+        }
+        SwarmAction::Status(args) => {
+            let agent_id = parse_thread_id(&args.id)?;
+            let status = thread_manager.agent_status(agent_id).await;
+            emit_swarm_output(
+                json_mode,
+                SwarmStatusOutput {
+                    status: status.clone(),
+                },
+                |_| format!("status={} ({})", agent_id, format_agent_status(&status)),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_swarm_sender_thread(
+    config: &Config,
+    session_id: Option<&str>,
+    last: bool,
+    all: bool,
+    thread_manager: &ThreadManager,
+    auth_manager: &Arc<AuthManager>,
+) -> anyhow::Result<ThreadId> {
+    let resume_path = resolve_swarm_resume_path(config, session_id, last, all).await?;
+    let NewThread { thread_id, .. } = if let Some(path) = resume_path {
+        thread_manager
+            .resume_thread_from_rollout(config.clone(), path, Arc::clone(auth_manager))
+            .await?
+    } else {
+        thread_manager.start_thread(config.clone()).await?
+    };
+    Ok(thread_id)
+}
+
+async fn resolve_swarm_resume_path(
+    config: &Config,
+    session_id: Option<&str>,
+    last: bool,
+    all: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    if last {
+        let default_provider_filter = vec![config.model_provider_id.clone()];
+        let filter_cwd = if all {
+            None
+        } else {
+            Some(config.cwd.as_path())
+        };
+        match codex_core::RolloutRecorder::find_latest_thread_path(
+            &config.codex_home,
+            1,
+            None,
+            codex_core::ThreadSortKey::UpdatedAt,
+            &[],
+            Some(default_provider_filter.as_slice()),
+            &config.model_provider_id,
+            filter_cwd,
+        )
+        .await
+        {
+            Ok(path) => Ok(path),
+            Err(e) => {
+                error!("Error listing threads: {e}");
+                Ok(None)
+            }
+        }
+    } else if let Some(id_str) = session_id {
+        if Uuid::parse_str(id_str).is_ok() {
+            let path = find_thread_path_by_id_str(&config.codex_home, id_str).await?;
+            Ok(path)
+        } else {
+            let path = find_thread_path_by_name_str(&config.codex_home, id_str).await?;
+            Ok(path)
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+fn agent_role_from_arg(arg: AgentTypeArg) -> AgentRole {
+    match arg {
+        AgentTypeArg::Default => AgentRole::Default,
+        AgentTypeArg::Explorer => AgentRole::Explorer,
+        AgentTypeArg::Worker => AgentRole::Worker,
+        AgentTypeArg::Orchestrator => AgentRole::Orchestrator,
+    }
+}
+
+fn build_spawn_config(
+    mut config: Config,
+    default_model: &str,
+    swarm_role: Option<&SwarmRole>,
+    agent_role: Option<AgentRole>,
+) -> anyhow::Result<Config> {
+    if let Some(role) = swarm_role {
+        if let Some(model) = role.model.as_ref() {
+            config.model = Some(model.clone());
+        }
+        if let Some(role_instructions) = role.base_instructions.as_ref()
+            && !role_instructions.trim().is_empty()
+        {
+            config.base_instructions = Some(match config.base_instructions.as_ref() {
+                Some(current) if !current.trim().is_empty() => {
+                    format!("{current}\n\n{role_instructions}")
+                }
+                _ => role_instructions.clone(),
+            });
+        }
+    }
+    if config.model.is_none() {
+        config.model = Some(default_model.to_string());
+    }
+    if let Some(agent_role) = agent_role {
+        agent_role
+            .apply_to_config(&mut config)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(config)
+}
+
+fn parse_thread_id(id: &str) -> anyhow::Result<codex_protocol::ThreadId> {
+    codex_protocol::ThreadId::from_string(id)
+        .map_err(|err| anyhow::anyhow!("invalid agent id {id}: {err:?}"))
+}
+
+fn resolve_wait_timeout(timeout_ms: Option<i64>) -> anyhow::Result<i64> {
+    let Some(timeout_ms) = timeout_ms else {
+        return Ok(DEFAULT_WAIT_TIMEOUT_MS);
+    };
+    if timeout_ms <= 0 {
+        anyhow::bail!("timeout_ms must be positive");
+    }
+    Ok(timeout_ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS))
+}
+
+async fn wait_for_final_status(
+    manager: Arc<ThreadManager>,
+    thread_id: codex_protocol::ThreadId,
+    mut status_rx: tokio::sync::watch::Receiver<AgentStatus>,
+) -> Option<(codex_protocol::ThreadId, AgentStatus)> {
+    let mut status = status_rx.borrow().clone();
+    if is_final_status(&status) {
+        return Some((thread_id, status));
+    }
+
+    loop {
+        if status_rx.changed().await.is_err() {
+            let latest = manager.agent_status(thread_id).await;
+            return is_final_status(&latest).then_some((thread_id, latest));
+        }
+        status = status_rx.borrow().clone();
+        if is_final_status(&status) {
+            return Some((thread_id, status));
+        }
+    }
+}
+
+fn is_final_status(status: &AgentStatus) -> bool {
+    !matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
+}
+
+fn format_wait_output(statuses: &HashMap<String, AgentStatus>, timed_out: bool) -> String {
+    if timed_out {
+        return "timed out".to_string();
+    }
+    let mut lines = Vec::new();
+    for (id, status) in statuses {
+        lines.push(format!("{id}: {}", format_agent_status(status)));
+    }
+    lines.join("\n")
+}
+
+fn format_agent_status(status: &AgentStatus) -> String {
+    match status {
+        AgentStatus::PendingInit => "pending init".to_string(),
+        AgentStatus::Running => "running".to_string(),
+        AgentStatus::Completed(Some(message)) => {
+            let preview = truncate_preview(message.trim(), 120);
+            if preview.is_empty() {
+                "completed".to_string()
+            } else {
+                format!("completed: \"{preview}\"")
+            }
+        }
+        AgentStatus::Completed(None) => "completed".to_string(),
+        AgentStatus::Errored(message) => {
+            let preview = truncate_preview(message.trim(), 120);
+            if preview.is_empty() {
+                "errored".to_string()
+            } else {
+                format!("errored: \"{preview}\"")
+            }
+        }
+        AgentStatus::Shutdown => "shutdown".to_string(),
+        AgentStatus::NotFound => "not found".to_string(),
+    }
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let preview = text.chars().take(max_chars).collect::<String>();
+    format!("{preview}…")
+}
+
+fn emit_swarm_output<T, F>(json_mode: bool, output: T, human: F) -> anyhow::Result<()>
+where
+    T: Serialize,
+    F: FnOnce(&T) -> String,
+{
+    if json_mode {
+        let payload = serde_json::to_string(&output)?;
+        #[allow(clippy::print_stdout)]
+        {
+            println!("{payload}");
+        }
+        return Ok(());
+    }
+
+    let text = human(&output);
+    #[allow(clippy::print_stdout)]
+    {
+        println!("{text}");
+    }
+    Ok(())
 }
 
 fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {

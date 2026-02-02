@@ -20,6 +20,7 @@ use codex_common::CliConfigOverrides;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
+use codex_exec::SwarmCommand;
 use codex_execpolicy::ExecPolicyCheckCommand;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_tui::AppExitInfo;
@@ -82,6 +83,9 @@ enum Subcommand {
 
     /// Run a code review non-interactively.
     Review(ReviewArgs),
+
+    /// Manage swarm agents (spawn, send input, wait, close, list, status).
+    Swarm(SwarmCommand),
 
     /// Manage login.
     Login(LoginCommand),
@@ -514,6 +518,15 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::Review(review_args)) => {
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
+            prepend_config_flags(
+                &mut exec_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
+        }
+        Some(Subcommand::Swarm(swarm_args)) => {
+            let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
+            exec_cli.command = Some(ExecCommand::Swarm(swarm_args));
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),

@@ -613,7 +613,10 @@ fn create_swarm_hub_tool() -> ToolSpec {
     properties.insert(
         "weight".to_string(),
         JsonSchema::Number {
-            description: Some("Optional vote weight.".to_string()),
+            description: Some(
+                "Optional vote weight. Defaults to 2 for Scholar (or tier>=2), 1 otherwise."
+                    .to_string(),
+            ),
         },
     );
     properties.insert(

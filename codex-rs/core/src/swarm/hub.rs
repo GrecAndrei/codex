@@ -97,6 +97,7 @@ pub struct SwarmHubState {
     pub timer: SwarmTimerState,
     pub leak_tracker: SwarmLeakTracker,
     pub leak_tracker_path: Option<PathBuf>,
+    pub storage_dir: Option<PathBuf>,
     pub tasks: Vec<SwarmTaskEntry>,
     pub evidence: Vec<SwarmEvidenceEntry>,
     pub decisions: Vec<SwarmDecisionEntry>,
@@ -116,6 +117,7 @@ impl Default for SwarmHubState {
             },
             leak_tracker: SwarmLeakTracker::default(),
             leak_tracker_path: None,
+            storage_dir: None,
             tasks: Vec::new(),
             evidence: Vec::new(),
             decisions: Vec::new(),
@@ -147,6 +149,9 @@ impl SwarmHub {
 
     pub async fn apply_config(&self, config: &SwarmHubConfig) {
         let mut state = self.state.write().await;
+        if let Some(storage_dir) = config.storage_dir.clone() {
+            state.storage_dir = Some(storage_dir);
+        }
         if let Some(path) = config.leak_tracker_path.clone() {
             state.leak_tracker_path = Some(path);
         } else if state.leak_tracker_path.is_none()
@@ -156,88 +161,195 @@ impl SwarmHub {
         }
     }
 
+    pub async fn load_from_storage(&self) -> Result<(), String> {
+        let (path, configured_leak_path, configured_storage_dir) = {
+            let state = self.state.read().await;
+            (
+                self.storage.hub_state_path(&state),
+                state.leak_tracker_path.clone(),
+                state.storage_dir.clone(),
+            )
+        };
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let contents = match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(format!("failed to read swarm hub state: {err}")),
+        };
+        let mut loaded: SwarmHubState = serde_json::from_str(&contents)
+            .map_err(|err| format!("failed to parse swarm hub state: {err}"))?;
+        if configured_leak_path.is_some() {
+            loaded.leak_tracker_path = configured_leak_path;
+        }
+        if configured_storage_dir.is_some() {
+            loaded.storage_dir = configured_storage_dir;
+        }
+        let mut state = self.state.write().await;
+        *state = loaded;
+        Ok(())
+    }
+
     pub async fn snapshot(&self) -> SwarmHubState {
         self.state.read().await.clone()
     }
 
+    pub async fn persist_now(&self) -> Result<(), String> {
+        let snapshot = self.state.read().await.clone();
+        self.persist_state(&snapshot).await?;
+        self.persist_leak_tracker(&snapshot).await
+    }
+
     pub async fn lounge_append(&self, entry: SwarmLoungeEntry) {
-        let mut state = self.state.write().await;
-        state.lounge.push_back(entry);
-        if state.lounge.len() > 500 {
-            state.lounge.pop_front();
-        }
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.lounge.push_back(entry);
+            if state.lounge.len() > 500 {
+                state.lounge.pop_front();
+            }
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn lounge_clear(&self) {
-        let mut state = self.state.write().await;
-        state.lounge.clear();
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.lounge.clear();
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn upsert_vote(&self, vote: SwarmVote) {
-        let mut state = self.state.write().await;
-        if let Some(existing) = state.votes.iter_mut().find(|v| v.id == vote.id) {
-            *existing = vote;
-        } else {
-            state.votes.push(vote);
-        }
+        let snapshot = {
+            let mut state = self.state.write().await;
+            if let Some(existing) = state.votes.iter_mut().find(|v| v.id == vote.id) {
+                *existing = vote;
+            } else {
+                state.votes.push(vote);
+            }
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn set_timer(&self, timer: SwarmTimerState) {
-        let mut state = self.state.write().await;
-        state.timer = timer;
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.timer = timer;
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn leak_tracker_set_path(&self, path: PathBuf, load_existing: bool) {
-        let mut state = self.state.write().await;
-        state.leak_tracker_path = Some(path.clone());
-        if load_existing {
-            if let Ok(contents) = tokio::fs::read_to_string(&path).await
-                && let Ok(parsed) = serde_json::from_str::<SwarmLeakTracker>(&contents)
-            {
-                state.leak_tracker = parsed;
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.leak_tracker_path = Some(path.clone());
+            if load_existing {
+                if let Ok(contents) = tokio::fs::read_to_string(&path).await
+                    && let Ok(parsed) = serde_json::from_str::<SwarmLeakTracker>(&contents)
+                {
+                    state.leak_tracker = parsed;
+                }
             }
-        }
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn leak_tracker_add(&self, entry: SwarmLeakEntry) -> Result<(), String> {
-        let mut state = self.state.write().await;
-        state.leak_tracker.entries.push(entry);
-        self.persist_leak_tracker(&state).await
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.leak_tracker.entries.push(entry);
+            state.clone()
+        };
+        self.persist_state(&snapshot).await?;
+        self.persist_leak_tracker(&snapshot).await
     }
 
     pub async fn leak_tracker_clear(&self) -> Result<(), String> {
-        let mut state = self.state.write().await;
-        state.leak_tracker.entries.clear();
-        self.persist_leak_tracker(&state).await
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.leak_tracker.entries.clear();
+            state.clone()
+        };
+        self.persist_state(&snapshot).await?;
+        self.persist_leak_tracker(&snapshot).await
     }
 
     pub async fn task_add(&self, entry: SwarmTaskEntry) {
-        let mut state = self.state.write().await;
-        state.tasks.push(entry);
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.tasks.push(entry);
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn evidence_add(&self, entry: SwarmEvidenceEntry) {
-        let mut state = self.state.write().await;
-        state.evidence.push(entry);
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.evidence.push(entry);
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn decision_add(&self, entry: SwarmDecisionEntry) {
-        let mut state = self.state.write().await;
-        state.decisions.push(entry);
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.decisions.push(entry);
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
     }
 
     pub async fn artifact_add(&self, entry: SwarmArtifactEntry) {
-        let mut state = self.state.write().await;
-        state.artifacts.push(entry);
+        let snapshot = {
+            let mut state = self.state.write().await;
+            state.artifacts.push(entry);
+            state.clone()
+        };
+        let _ = self.persist_state(&snapshot).await;
+    }
+
+    async fn persist_state(&self, state: &SwarmHubState) -> Result<(), String> {
+        let Some(path) = self.storage.hub_state_path(state) else {
+            return Ok(());
+        };
+        let payload = serde_json::to_string_pretty(state)
+            .map_err(|err| format!("failed to serialize swarm hub state: {err}"))?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| format!("failed to create swarm hub dir: {err}"))?;
+        }
+        tokio::fs::write(&path, payload)
+            .await
+            .map_err(|err| format!("failed to write swarm hub state: {err}"))?;
+        Ok(())
     }
 
     async fn persist_leak_tracker(&self, state: &SwarmHubState) -> Result<(), String> {
-        let Some(path) = state.leak_tracker_path.clone().or_else(|| {
-            self.storage
-                .codex_home
-                .clone()
-                .map(|home| home.join("swarm_leak_tracker.json"))
-        }) else {
+        let Some(path) = state
+            .leak_tracker_path
+            .clone()
+            .or_else(|| {
+                state
+                    .storage_dir
+                    .clone()
+                    .map(|dir| dir.join("leak_tracker.json"))
+            })
+            .or_else(|| {
+                self.storage
+                    .codex_home
+                    .clone()
+                    .map(|home| home.join("swarm_leak_tracker.json"))
+            })
+        else {
             return Ok(());
         };
         let payload = serde_json::to_string_pretty(&state.leak_tracker)
@@ -251,6 +363,16 @@ impl SwarmHub {
             .await
             .map_err(|err| format!("failed to write leak tracker: {err}"))?;
         Ok(())
+    }
+}
+
+impl SwarmHubStorage {
+    fn hub_state_path(&self, state: &SwarmHubState) -> Option<PathBuf> {
+        let base = state
+            .storage_dir
+            .clone()
+            .or_else(|| self.codex_home.clone().map(|home| home.join("swarm")));
+        base.map(|dir| dir.join("swarm_hub.json"))
     }
 }
 

@@ -90,6 +90,7 @@ use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_core::skills::model::SkillMetadata;
+use codex_core::swarm::SwarmConfig;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_otel::OtelManager;
@@ -135,6 +136,7 @@ const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
+use crate::app_event::SwarmSettingsField;
 #[cfg(target_os = "windows")]
 use crate::app_event::WindowsSandboxEnableMode;
 use crate::app_event::WindowsSandboxFallbackReason;
@@ -2867,6 +2869,9 @@ impl ChatWidget {
             SlashCommand::Swarm => {
                 self.app_event_tx.send(AppEvent::OpenSwarmDashboard);
             }
+            SlashCommand::SwarmSettings => {
+                self.app_event_tx.send(AppEvent::OpenSwarmSettingsPopup);
+            }
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
             }
@@ -4521,6 +4526,253 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    pub(crate) fn open_swarm_settings_popup(&mut self) {
+        let enabled = self.config.swarm.enabled;
+        let root_role = self.config.swarm.root_role.clone();
+        let default_spawn_role = self.config.swarm.default_spawn_role.clone();
+        let leak_tracker_path = self
+            .config
+            .swarm
+            .hub
+            .leak_tracker_path
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let storage_dir = self
+            .config
+            .swarm
+            .hub
+            .storage_dir
+            .as_ref()
+            .map(|path| path.display().to_string());
+
+        let enabled_label = if enabled {
+            "Disable swarm"
+        } else {
+            "Enable swarm"
+        };
+        let enabled_desc = if enabled {
+            "Currently enabled"
+        } else {
+            "Currently disabled"
+        };
+
+        let mut items = Vec::new();
+        items.push(SelectionItem {
+            name: enabled_label.to_string(),
+            description: Some(enabled_desc.to_string()),
+            is_current: enabled,
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::UpdateSwarmEnabled(!enabled));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        let root_desc = format!(
+            "Current: {}",
+            root_role.as_ref().map(String::as_str).unwrap_or("default")
+        );
+        items.push(SelectionItem {
+            name: "Set root role".to_string(),
+            description: Some(root_desc),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenSwarmSettingsPrompt(
+                    SwarmSettingsField::RootRole,
+                ));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        if root_role.is_some() {
+            items.push(SelectionItem {
+                name: "Clear root role (use default)".to_string(),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::UpdateSwarmRootRole(None));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let default_desc = format!(
+            "Current: {}",
+            default_spawn_role
+                .as_ref()
+                .map(String::as_str)
+                .unwrap_or("default")
+        );
+        items.push(SelectionItem {
+            name: "Set default spawn role".to_string(),
+            description: Some(default_desc),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenSwarmSettingsPrompt(
+                    SwarmSettingsField::DefaultSpawnRole,
+                ));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        if default_spawn_role.is_some() {
+            items.push(SelectionItem {
+                name: "Clear default spawn role".to_string(),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::UpdateSwarmDefaultSpawnRole(None));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let leak_desc = format!(
+            "Current: {}",
+            leak_tracker_path.as_deref().unwrap_or("unset")
+        );
+        items.push(SelectionItem {
+            name: "Set leak tracker path".to_string(),
+            description: Some(leak_desc),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenSwarmSettingsPrompt(
+                    SwarmSettingsField::LeakTrackerPath,
+                ));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        if leak_tracker_path.is_some() {
+            items.push(SelectionItem {
+                name: "Clear leak tracker path".to_string(),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::UpdateSwarmLeakTrackerPath(None));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        let storage_desc = format!("Current: {}", storage_dir.as_deref().unwrap_or("unset"));
+        items.push(SelectionItem {
+            name: "Set storage directory".to_string(),
+            description: Some(storage_desc),
+            actions: vec![Box::new(|tx| {
+                tx.send(AppEvent::OpenSwarmSettingsPrompt(
+                    SwarmSettingsField::StorageDir,
+                ));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        if storage_dir.is_some() {
+            items.push(SelectionItem {
+                name: "Clear storage directory".to_string(),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::UpdateSwarmStorageDir(None));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        items.push(SelectionItem {
+            name: "Roles & hierarchy".to_string(),
+            description: Some("Edit in config.toml for now.".to_string()),
+            is_disabled: true,
+            disabled_reason: Some("Not yet editable in TUI".to_string()),
+            ..Default::default()
+        });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Swarm Settings".to_string()),
+            subtitle: Some("Configure swarm roles and hub storage".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn open_swarm_settings_prompt(&mut self, field: SwarmSettingsField) {
+        let tx = self.app_event_tx.clone();
+        let (title, placeholder, context_label, on_submit): (
+            String,
+            String,
+            Option<String>,
+            Box<dyn Fn(String) + Send + Sync>,
+        ) = match field {
+            SwarmSettingsField::RootRole => {
+                let current = self
+                    .config
+                    .swarm
+                    .root_role
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                (
+                    "Set swarm root role".to_string(),
+                    "Type a role name and press Enter".to_string(),
+                    Some(format!("Current: {current}")),
+                    Box::new(move |input| {
+                        tx.send(AppEvent::UpdateSwarmRootRole(Some(input)));
+                    }),
+                )
+            }
+            SwarmSettingsField::DefaultSpawnRole => {
+                let current = self
+                    .config
+                    .swarm
+                    .default_spawn_role
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                (
+                    "Set default spawn role".to_string(),
+                    "Type a role name and press Enter".to_string(),
+                    Some(format!("Current: {current}")),
+                    Box::new(move |input| {
+                        tx.send(AppEvent::UpdateSwarmDefaultSpawnRole(Some(input)));
+                    }),
+                )
+            }
+            SwarmSettingsField::LeakTrackerPath => {
+                let current = self
+                    .config
+                    .swarm
+                    .hub
+                    .leak_tracker_path
+                    .as_ref()
+                    .map(|path| path.display().to_string());
+                let context = current.map(|value| format!("Current: {value}"));
+                (
+                    "Set leak tracker path".to_string(),
+                    "Type a path and press Enter".to_string(),
+                    context,
+                    Box::new(move |input| {
+                        tx.send(AppEvent::UpdateSwarmLeakTrackerPath(Some(PathBuf::from(
+                            input,
+                        ))));
+                    }),
+                )
+            }
+            SwarmSettingsField::StorageDir => {
+                let current = self
+                    .config
+                    .swarm
+                    .hub
+                    .storage_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string());
+                let context = current.map(|value| format!("Current: {value}"));
+                (
+                    "Set swarm storage directory".to_string(),
+                    "Type a directory path and press Enter".to_string(),
+                    context,
+                    Box::new(move |input| {
+                        tx.send(AppEvent::UpdateSwarmStorageDir(Some(PathBuf::from(input))));
+                    }),
+                )
+            }
+        };
+
+        let view = CustomPromptView::new(title, placeholder, context_label, on_submit);
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     fn approval_preset_actions(
         approval: AskForApproval,
         sandbox: SandboxPolicy,
@@ -5145,6 +5397,10 @@ impl ChatWidget {
                     ),
             );
         }
+    }
+
+    pub(crate) fn update_swarm_config(&mut self, swarm: SwarmConfig) {
+        self.config.swarm = swarm;
     }
 
     pub(crate) fn set_full_access_warning_acknowledged(&mut self, acknowledged: bool) {
