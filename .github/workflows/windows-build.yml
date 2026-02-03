@@ -1,0 +1,35 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy, rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+      - name: Build codex CLI (release)
+        run: cargo build -p codex-cli --bin codex --release
+      - name: Package artifact
+        run: |
+          $dest = "artifacts"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "target\\release\\codex.exe" "$dest\\codex.exe"
+          Compress-Archive -Path "$dest\\codex.exe" -DestinationPath "$dest\\codex-windows-x64.zip" -Force
+      - uses: actions/upload-artifact@v6
+        with:
+          name: codex-windows-x64
+          path: codex-rs/artifacts/codex-windows-x64.zip
