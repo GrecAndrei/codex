@@ -1098,7 +1098,10 @@ impl SwarmOverlay {
             return Vec::new();
         }
         if self.agents.is_empty() {
-            return vec![Line::from("No agents yet.".dim())];
+            return vec![
+                Line::from("No agents yet.".dim()),
+                Line::from("Use /swarm-settings to enable.".dim()),
+            ];
         }
         let label_width = width.saturating_sub(2).max(1) as usize;
         self.agents

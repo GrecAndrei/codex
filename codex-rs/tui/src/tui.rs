@@ -239,6 +239,7 @@ pub struct Tui {
     pub(crate) terminal: Terminal,
     pending_history_lines: Vec<Line<'static>>,
     alt_saved_viewport: Option<ratatui::layout::Rect>,
+    overlay_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
     // True when overlay alt-screen UI is active
@@ -270,6 +271,7 @@ impl Tui {
             terminal,
             pending_history_lines: vec![],
             alt_saved_viewport: None,
+            overlay_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
             alt_screen_active: Arc::new(AtomicBool::new(false)),
@@ -419,6 +421,26 @@ impl Tui {
         Ok(())
     }
 
+    /// Enter a full-screen overlay. Uses alt-screen if enabled; otherwise expands the viewport.
+    pub fn enter_overlay_screen(&mut self) -> Result<()> {
+        if self.alt_screen_enabled {
+            return self.enter_alt_screen();
+        }
+        if self.overlay_saved_viewport.is_none() {
+            self.overlay_saved_viewport = Some(self.terminal.viewport_area);
+        }
+        if let Ok(size) = self.terminal.size() {
+            self.terminal.set_viewport_area(ratatui::layout::Rect::new(
+                0,
+                0,
+                size.width,
+                size.height,
+            ));
+            let _ = self.terminal.clear();
+        }
+        Ok(())
+    }
+
     /// Leave alternate screen and restore the previously saved inline viewport, if any.
     pub fn leave_alt_screen(&mut self) -> Result<()> {
         if !self.alt_screen_enabled {
@@ -431,6 +453,18 @@ impl Tui {
             self.terminal.set_viewport_area(saved);
         }
         self.alt_screen_active.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Leave a full-screen overlay. Restores inline viewport when alt-screen is disabled.
+    pub fn leave_overlay_screen(&mut self) -> Result<()> {
+        if self.alt_screen_enabled {
+            return self.leave_alt_screen();
+        }
+        if let Some(saved) = self.overlay_saved_viewport.take() {
+            self.terminal.set_viewport_area(saved);
+            let _ = self.terminal.clear();
+        }
         Ok(())
     }
 

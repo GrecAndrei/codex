@@ -227,14 +227,14 @@ struct AltScreenGuard<'a> {
 
 impl<'a> AltScreenGuard<'a> {
     fn enter(tui: &'a mut Tui) -> Self {
-        let _ = tui.enter_alt_screen();
+        let _ = tui.enter_overlay_screen();
         Self { tui }
     }
 }
 
 impl Drop for AltScreenGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.tui.leave_alt_screen();
+        let _ = self.tui.leave_overlay_screen();
     }
 }
 

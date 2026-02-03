@@ -964,7 +964,7 @@ impl App {
     }
 
     fn open_swarm_dashboard(&mut self, tui: &mut tui::Tui) {
-        let _ = tui.enter_alt_screen();
+        let _ = tui.enter_overlay_screen();
         self.overlay = Some(Overlay::new_swarm());
         tui.frame_requester().schedule_frame();
     }
@@ -1906,7 +1906,7 @@ impl App {
                 // Clear the in-progress state in the bottom pane
                 self.chat_widget.on_diff_complete();
                 // Enter alternate screen using TUI helper and build pager lines
-                let _ = tui.enter_alt_screen();
+                let _ = tui.enter_overlay_screen();
                 let pager_lines: Vec<ratatui::text::Line<'static>> = if text.trim().is_empty() {
                     vec!["No changes detected.".italic().into()]
                 } else {
@@ -2705,7 +2705,7 @@ impl App {
             }
             AppEvent::FullScreenApprovalRequest(request) => match request {
                 ApprovalRequest::ApplyPatch { cwd, changes, .. } => {
-                    let _ = tui.enter_alt_screen();
+                    let _ = tui.enter_overlay_screen();
                     let diff_summary = DiffSummary::new(changes, cwd);
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![diff_summary.into()],
@@ -2713,7 +2713,7 @@ impl App {
                     ));
                 }
                 ApprovalRequest::Exec { command, .. } => {
-                    let _ = tui.enter_alt_screen();
+                    let _ = tui.enter_overlay_screen();
                     let full_cmd = strip_bash_lc_and_escape(&command);
                     let full_cmd_lines = highlight_bash_to_lines(&full_cmd);
                     self.overlay = Some(Overlay::new_static_with_lines(
@@ -2726,7 +2726,7 @@ impl App {
                     message,
                     ..
                 } => {
-                    let _ = tui.enter_alt_screen();
+                    let _ = tui.enter_overlay_screen();
                     let paragraph = Paragraph::new(vec![
                         Line::from(vec!["Server: ".into(), server_name.bold()]),
                         Line::from(""),
@@ -2941,7 +2941,7 @@ impl App {
                 ..
             } => {
                 // Enter alternate screen and set viewport to full size.
-                let _ = tui.enter_alt_screen();
+                let _ = tui.enter_overlay_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
                 tui.frame_requester().schedule_frame();
             }
@@ -3071,7 +3071,8 @@ fn build_swarm_hub_lines(hub_state: Option<&SwarmHubState>, width: u16) -> Vec<L
     let mut lines: Vec<Line<'static>> = Vec::new();
     let width = width.max(1) as usize;
     let Some(hub_state) = hub_state else {
-        lines.push(Line::from("Swarm Hub disabled.".dim()));
+        lines.push(Line::from("Swarm disabled.".yellow().bold()));
+        lines.push(Line::from("Use /swarm-settings to enable.".dim()));
         return lines;
     };
 

@@ -225,14 +225,14 @@ impl App {
 
     /// Open transcript overlay (enters alternate screen and shows full transcript).
     pub(crate) fn open_transcript_overlay(&mut self, tui: &mut tui::Tui) {
-        let _ = tui.enter_alt_screen();
+        let _ = tui.enter_overlay_screen();
         self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
         tui.frame_requester().schedule_frame();
     }
 
     /// Close transcript overlay and restore normal UI.
     pub(crate) fn close_transcript_overlay(&mut self, tui: &mut tui::Tui) {
-        let _ = tui.leave_alt_screen();
+        let _ = tui.leave_overlay_screen();
         let was_backtrack = self.backtrack.overlay_preview_active;
         if !self.deferred_history_lines.is_empty() {
             let lines = std::mem::take(&mut self.deferred_history_lines);
