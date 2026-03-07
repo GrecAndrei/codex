@@ -61,6 +61,7 @@ mod model_provider_info;
 pub mod path_utils;
 pub mod personality_migration;
 pub mod plugins;
+mod prompt_hooks;
 mod sandbox_tags;
 pub mod sandboxing;
 mod session_prefix;

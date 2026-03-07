@@ -21,6 +21,8 @@ use crate::codex::TurnContext;
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::config::Constrained;
 use crate::features::Feature;
+use crate::prompt_hooks::PromptHookTarget;
+use crate::prompt_hooks::PromptHooks;
 use crate::review_format::format_review_findings_block;
 use crate::review_format::render_review_output_text;
 use crate::state::TaskKind;
@@ -103,7 +105,12 @@ async fn start_review_conversation(
     let _ = sub_agent_config.features.disable(Feature::Collab);
 
     // Set explicit review rubric for the sub-agent
-    sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
+    let prompt_hooks = PromptHooks::load(&ctx.config.codex_home);
+    sub_agent_config.base_instructions = Some(prompt_hooks.apply_text(
+        PromptHookTarget::ReviewPrompt,
+        &ctx.config.codex_home,
+        crate::REVIEW_PROMPT.to_string(),
+    ));
     sub_agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
 
     let model = config

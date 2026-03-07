@@ -1710,6 +1710,93 @@ async fn includes_developer_instructions_message_in_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_hooks_customize_request_layers_and_write_docs() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let prompt_hooks = r#"
+[base_instructions]
+text = "base hook"
+
+[developer_message]
+text = "developer hook"
+
+[user_context]
+text = "user hook"
+"#;
+    let mut builder = test_codex()
+        .with_home(codex_home.clone())
+        .with_pre_build_hook(move |home| {
+            std::fs::write(home.join("prompt-hooks.toml"), prompt_hooks).expect("write prompt hooks");
+        })
+        .with_auth(CodexAuth::from_api_key("Test API Key"));
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create new conversation")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = resp_mock.single_request();
+    let request_body = request.body_json();
+
+    assert!(
+        request_body["instructions"]
+            .as_str()
+            .expect("instructions string")
+            .contains("base hook")
+    );
+
+    let developer_messages: Vec<&serde_json::Value> = request_body["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .filter(|item| item.get("role").and_then(|role| role.as_str()) == Some("developer"))
+        .collect();
+    assert!(
+        developer_messages
+            .iter()
+            .any(|item| message_input_texts(item).contains(&"developer hook")),
+        "expected prompt hook in developer message, got {:?}",
+        request_body["input"]
+    );
+
+    let user_messages: Vec<&serde_json::Value> = request_body["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .filter(|item| item.get("role").and_then(|role| role.as_str()) == Some("user"))
+        .collect();
+    assert!(
+        user_messages
+            .iter()
+            .any(|item| message_input_texts(item).contains(&"user hook")),
+        "expected prompt hook in user context, got {:?}",
+        request_body["input"]
+    );
+
+    assert!(codex_home.path().join("docs/prompt-hooks.md").is_file());
+    assert!(codex_home.path().join("docs/prompt-hooks.example.toml").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn azure_responses_request_includes_store_and_reasoning_ids() {
     skip_if_no_network!();
 

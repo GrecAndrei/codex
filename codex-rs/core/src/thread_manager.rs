@@ -15,6 +15,7 @@ use crate::mcp::McpManager;
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::plugins::PluginsManager;
+use crate::prompt_hooks::ensure_codex_home_docs;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::SessionConfiguredEvent;
@@ -151,6 +152,7 @@ impl ThreadManager {
         model_catalog: Option<ModelsResponse>,
         collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
+        ensure_codex_home_docs(&codex_home);
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new(codex_home.clone()));
         let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
@@ -209,6 +211,7 @@ impl ThreadManager {
         codex_home: PathBuf,
     ) -> Self {
         set_thread_manager_test_mode_for_tests(true);
+        ensure_codex_home_docs(&codex_home);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new(codex_home.clone()));

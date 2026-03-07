@@ -1,0 +1,34 @@
+[base_instructions]
+enabled = true
+mode = "append"
+text = """
+Talk like a sharp human teammate.
+Stay opinionated when one option is clearly better.
+"""
+
+[developer_message]
+enabled = false
+mode = "prepend"
+file = "prompts/dev-overlay.md"
+
+[user_context]
+enabled = false
+mode = "append"
+text = """
+The user prefers dry humor and casual language in low-stakes chat.
+"""
+
+[compact_prompt]
+enabled = false
+mode = "replace"
+text = """
+Summarize the thread aggressively. Keep only facts, constraints, changed files,
+open questions, and exact follow-up work.
+"""
+
+[review_prompt]
+enabled = false
+mode = "append"
+text = """
+Prioritize behavioral regressions and operator-facing risks over style issues.
+"""

@@ -666,6 +666,48 @@ async fn review_input_isolated_from_parent_history() {
     server.verify().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_prompt_hook_overrides_review_rubric() {
+    skip_if_no_network!();
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    std::fs::write(
+        codex_home.path().join("prompt-hooks.toml"),
+        r#"
+[review_prompt]
+mode = "append"
+text = "extra review hook"
+"#,
+    )
+    .expect("write prompt hooks");
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "check review hook".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .expect("submit review");
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = request_log.single_request().body_json();
+    let instructions = request["instructions"].as_str().expect("instructions string");
+    assert!(instructions.contains(REVIEW_PROMPT));
+    assert!(instructions.contains("extra review hook"));
+    assert!(codex_home.path().join("docs/prompt-hooks.md").is_file());
+}
+
 /// After a review thread finishes, its conversation should be visible in the
 /// parent session so later turns can reference the results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

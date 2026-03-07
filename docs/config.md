@@ -6,6 +6,14 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
+## Prompt hooks
+
+This fork supports a sidecar prompt hook file at `~/.codex/prompt-hooks.toml`.
+Codex also writes companion docs to `~/.codex/docs/` so the hook format stays
+discoverable on your machine.
+
+See `docs/prompt-hooks.md` for the hook targets and merge modes.
+
 ## Connecting to MCP servers
 
 Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the configuration reference for the latest MCP server options:

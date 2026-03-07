@@ -34,6 +34,8 @@ use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
+use crate::prompt_hooks::PromptHookTarget;
+use crate::prompt_hooks::PromptHooks;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::realtime_conversation::handle_audio as handle_realtime_conversation_audio;
 use crate::realtime_conversation::handle_close as handle_realtime_conversation_close;
@@ -442,11 +444,30 @@ impl Codex {
         // 2. conversation history => session_meta.base_instructions
         // 3. base_instructions for current model
         let model_info = models_manager.get_model_info(model.as_str(), &config).await;
-        let base_instructions = config
-            .base_instructions
-            .clone()
-            .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+        let prompt_hooks = PromptHooks::load(&config.codex_home);
+        let base_instructions = prompt_hooks.apply_text(
+            PromptHookTarget::BaseInstructions,
+            &config.codex_home,
+            config
+                .base_instructions
+                .clone()
+                .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
+                .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+        );
+        let compact_prompt = if config.compact_prompt.is_some()
+            || prompt_hooks.has_hook_content(PromptHookTarget::CompactPrompt, &config.codex_home)
+        {
+            Some(prompt_hooks.apply_text(
+                PromptHookTarget::CompactPrompt,
+                &config.codex_home,
+                config
+                    .compact_prompt
+                    .clone()
+                    .unwrap_or_else(|| compact::SUMMARIZATION_PROMPT.to_string()),
+            ))
+        } else {
+            None
+        };
 
         // Respect thread-start tools. When missing (resumed/forked threads), read from the db
         // first, then fall back to rollout-file tools.
@@ -494,7 +515,7 @@ impl Codex {
             user_instructions,
             personality: config.personality,
             base_instructions,
-            compact_prompt: config.compact_prompt.clone(),
+            compact_prompt,
             approval_policy: config.permissions.approval_policy.clone(),
             sandbox_policy: config.permissions.sandbox_policy.clone(),
             file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
@@ -3170,6 +3191,7 @@ impl Session {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
         let shell = self.user_shell();
+        let prompt_hooks = PromptHooks::load(&turn_context.config.codex_home);
         let (reference_context_item, previous_turn_settings, collaboration_mode, base_instructions) = {
             let state = self.state.lock().await;
             (
@@ -3269,6 +3291,16 @@ impl Session {
             EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
                 .with_subagents(subagents)
                 .serialize_to_xml(),
+        );
+        developer_sections = prompt_hooks.apply_sections(
+            PromptHookTarget::DeveloperMessage,
+            &turn_context.config.codex_home,
+            developer_sections,
+        );
+        contextual_user_sections = prompt_hooks.apply_sections(
+            PromptHookTarget::UserContext,
+            &turn_context.config.codex_home,
+            contextual_user_sections,
         );
 
         let mut items = Vec::with_capacity(2);
