@@ -391,6 +391,9 @@ pub enum Op {
     /// Request the list of available custom prompts.
     ListCustomPrompts,
 
+    /// Request the currently assembled prompt stack for this session.
+    GetPromptTrace { scope: PromptTraceScope },
+
     /// Request the list of skills for the provided `cwd` values or the session default.
     ListSkills {
         /// Working directories to scope repo skills discovery.
@@ -1168,6 +1171,9 @@ pub enum EventMsg {
 
     /// List of custom prompts available to the agent.
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
+
+    /// Prompt stack snapshot for the current session.
+    PromptTraceResponse(PromptTraceResponseEvent),
 
     /// List of skills available to the agent.
     ListSkillsResponse(ListSkillsResponseEvent),
@@ -2687,6 +2693,35 @@ impl fmt::Display for McpAuthStatus {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ListCustomPromptsResponseEvent {
     pub custom_prompts: Vec<CustomPrompt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(rename_all = "kebab-case")]
+pub enum PromptTraceScope {
+    All,
+    Base,
+    Developer,
+    User,
+    Compact,
+    Review,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct PromptTraceSection {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub send_to_llm: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct PromptTraceResponseEvent {
+    pub scope: PromptTraceScope,
+    pub sections: Vec<PromptTraceSection>,
 }
 
 /// Response payload for `Op::ListSkills`.

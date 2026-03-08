@@ -332,6 +332,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::McpToolCallEnd(_)
                     | EventMsg::McpListToolsResponse(_)
                     | EventMsg::ListCustomPromptsResponse(_)
+                    | EventMsg::PromptTraceResponse(_)
                     | EventMsg::ListSkillsResponse(_)
                     | EventMsg::ListRemoteSkillsResponse(_)
                     | EventMsg::RemoteSkillDownloaded(_)

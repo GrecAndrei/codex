@@ -90,17 +90,20 @@ impl PromptHooks {
         self.hook(target).apply_text(codex_home, base)
     }
 
-    pub(crate) fn apply_sections(
+    pub(crate) fn has_hook_content(&self, target: PromptHookTarget, codex_home: &Path) -> bool {
+        self.hook(target).render(codex_home).is_some()
+    }
+
+    pub(crate) fn render_text(
         &self,
         target: PromptHookTarget,
         codex_home: &Path,
-        sections: Vec<String>,
-    ) -> Vec<String> {
-        self.hook(target).apply_sections(codex_home, sections)
+    ) -> Option<String> {
+        self.hook(target).render(codex_home)
     }
 
-    pub(crate) fn has_hook_content(&self, target: PromptHookTarget, codex_home: &Path) -> bool {
-        self.hook(target).render(codex_home).is_some()
+    pub(crate) fn merge_mode(&self, target: PromptHookTarget) -> PromptHookMergeMode {
+        self.hook(target).mode
     }
 
     fn hook(&self, target: PromptHookTarget) -> &PromptHook {
@@ -123,33 +126,6 @@ impl PromptHook {
         merge_text(&base, &fragment, self.mode)
     }
 
-    fn apply_sections(&self, codex_home: &Path, sections: Vec<String>) -> Vec<String> {
-        let Some(fragment) = self.render(codex_home) else {
-            return sections;
-        };
-
-        match self.mode {
-            PromptHookMergeMode::Append => {
-                let mut merged = sections;
-                merged.push(fragment);
-                merged
-            }
-            PromptHookMergeMode::Prepend => {
-                let mut merged = Vec::with_capacity(sections.len() + 1);
-                merged.push(fragment);
-                merged.extend(sections);
-                merged
-            }
-            PromptHookMergeMode::Replace => {
-                if fragment.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![fragment]
-                }
-            }
-        }
-    }
-
     fn render(&self, codex_home: &Path) -> Option<String> {
         if !self.enabled {
             return None;
@@ -164,11 +140,9 @@ impl PromptHook {
             (None, None) => None,
             (Some(file_text), None) => Some(file_text),
             (None, Some(text)) => Some(text),
-            (Some(file_text), Some(text)) => Some(merge_text(
-                &file_text,
-                &text,
-                PromptHookMergeMode::Append,
-            )),
+            (Some(file_text), Some(text)) => {
+                Some(merge_text(&file_text, &text, PromptHookMergeMode::Append))
+            }
         }
     }
 }
@@ -176,7 +150,10 @@ impl PromptHook {
 pub(crate) fn ensure_codex_home_docs(codex_home: &Path) {
     let docs_dir = codex_home.join(DOCS_SUBDIR);
     if let Err(err) = std::fs::create_dir_all(&docs_dir) {
-        warn!("failed to create prompt hook docs dir {}: {err}", docs_dir.display());
+        warn!(
+            "failed to create prompt hook docs dir {}: {err}",
+            docs_dir.display()
+        );
         return;
     }
 
@@ -208,7 +185,10 @@ fn read_hook_file(codex_home: &Path, path: &Path) -> Option<String> {
     match std::fs::read_to_string(&resolved) {
         Ok(contents) => Some(contents),
         Err(err) => {
-            warn!("failed to read prompt hook file {}: {err}", resolved.display());
+            warn!(
+                "failed to read prompt hook file {}: {err}",
+                resolved.display()
+            );
             None
         }
     }
@@ -256,8 +236,14 @@ mod tests {
             ..PromptHook::default()
         };
 
-        assert_eq!(append.apply_text(tmp.path(), "base".to_string()), "base\n\ntail");
-        assert_eq!(prepend.apply_text(tmp.path(), "base".to_string()), "head\n\nbase");
+        assert_eq!(
+            append.apply_text(tmp.path(), "base".to_string()),
+            "base\n\ntail"
+        );
+        assert_eq!(
+            prepend.apply_text(tmp.path(), "base".to_string()),
+            "head\n\nbase"
+        );
         assert_eq!(replace.apply_text(tmp.path(), "base".to_string()), "new");
     }
 

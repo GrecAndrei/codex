@@ -38,6 +38,17 @@ pub enum SlashCommand {
     Mention,
     Status,
     DebugConfig,
+    Prompts,
+    #[strum(serialize = "prompts-base")]
+    PromptsBase,
+    #[strum(serialize = "prompts-dev")]
+    PromptsDev,
+    #[strum(serialize = "prompts-user")]
+    PromptsUser,
+    #[strum(serialize = "prompts-compact")]
+    PromptsCompact,
+    #[strum(serialize = "prompts-review")]
+    PromptsReview,
     Statusline,
     Theme,
     Mcp,
@@ -83,6 +94,12 @@ impl SlashCommand {
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
+            SlashCommand::Prompts => "show the full assembled prompt stack for this session",
+            SlashCommand::PromptsBase => "show the current base instructions",
+            SlashCommand::PromptsDev => "show the current developer message stack",
+            SlashCommand::PromptsUser => "show the current user-context prompt stack",
+            SlashCommand::PromptsCompact => "show the current compact prompt",
+            SlashCommand::PromptsReview => "show the current review prompt",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
@@ -160,6 +177,12 @@ impl SlashCommand {
             | SlashCommand::Skills
             | SlashCommand::Status
             | SlashCommand::DebugConfig
+            | SlashCommand::Prompts
+            | SlashCommand::PromptsBase
+            | SlashCommand::PromptsDev
+            | SlashCommand::PromptsUser
+            | SlashCommand::PromptsCompact
+            | SlashCommand::PromptsReview
             | SlashCommand::Ps
             | SlashCommand::Clean
             | SlashCommand::Mcp

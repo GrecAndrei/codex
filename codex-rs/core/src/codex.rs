@@ -95,6 +95,9 @@ use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::PromptTraceResponseEvent;
+use codex_protocol::protocol::PromptTraceScope;
+use codex_protocol::protocol::PromptTraceSection;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
@@ -457,14 +460,16 @@ impl Codex {
         let compact_prompt = if config.compact_prompt.is_some()
             || prompt_hooks.has_hook_content(PromptHookTarget::CompactPrompt, &config.codex_home)
         {
-            Some(prompt_hooks.apply_text(
-                PromptHookTarget::CompactPrompt,
-                &config.codex_home,
-                config
-                    .compact_prompt
-                    .clone()
-                    .unwrap_or_else(|| compact::SUMMARIZATION_PROMPT.to_string()),
-            ))
+            Some(
+                prompt_hooks.apply_text(
+                    PromptHookTarget::CompactPrompt,
+                    &config.codex_home,
+                    config
+                        .compact_prompt
+                        .clone()
+                        .unwrap_or_else(|| compact::SUMMARIZATION_PROMPT.to_string()),
+                ),
+            )
         } else {
             None
         };
@@ -732,6 +737,21 @@ pub(crate) struct TurnContext {
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) turn_skills: TurnSkillsContext,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptSectionDraft {
+    id: &'static str,
+    title: &'static str,
+    role: Option<&'static str>,
+    text: String,
+    send_to_llm: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct InitialPromptSections {
+    developer_sections: Vec<PromptSectionDraft>,
+    contextual_user_sections: Vec<PromptSectionDraft>,
 }
 impl TurnContext {
     pub(crate) fn model_context_window(&self) -> Option<i64> {
@@ -3188,8 +3208,38 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> Vec<ResponseItem> {
-        let mut developer_sections = Vec::<String>::with_capacity(8);
-        let mut contextual_user_sections = Vec::<String>::with_capacity(2);
+        let prompt_sections = self.collect_initial_prompt_sections(turn_context).await;
+        let developer_sections = prompt_sections
+            .developer_sections
+            .into_iter()
+            .map(|section| section.text)
+            .collect();
+        let contextual_user_sections = prompt_sections
+            .contextual_user_sections
+            .into_iter()
+            .map(|section| section.text)
+            .collect();
+
+        let mut items = Vec::with_capacity(2);
+        if let Some(developer_message) =
+            crate::context_manager::updates::build_developer_update_item(developer_sections)
+        {
+            items.push(developer_message);
+        }
+        if let Some(contextual_user_message) =
+            crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
+        {
+            items.push(contextual_user_message);
+        }
+        items
+    }
+
+    async fn collect_initial_prompt_sections(
+        &self,
+        turn_context: &TurnContext,
+    ) -> InitialPromptSections {
+        let mut developer_sections = Vec::<PromptSectionDraft>::with_capacity(8);
+        let mut contextual_user_sections = Vec::<PromptSectionDraft>::with_capacity(2);
         let shell = self.user_shell();
         let prompt_hooks = PromptHooks::load(&turn_context.config.codex_home);
         let (reference_context_item, previous_turn_settings, collaboration_mode, base_instructions) = {
@@ -3207,10 +3257,19 @@ impl Session {
                 turn_context,
             )
         {
-            developer_sections.push(model_switch_message.into_text());
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.model_switch",
+                title: "Developer: model switch",
+                role: Some("developer"),
+                text: model_switch_message.into_text(),
+                send_to_llm: true,
+            });
         }
-        developer_sections.push(
-            DeveloperInstructions::from_policy(
+        developer_sections.push(PromptSectionDraft {
+            id: "developer.policy",
+            title: "Developer: policy",
+            role: Some("developer"),
+            text: DeveloperInstructions::from_policy(
                 turn_context.sandbox_policy.get(),
                 turn_context.approval_policy.value(),
                 turn_context.features.enabled(Feature::GuardianApproval),
@@ -3219,9 +3278,16 @@ impl Session {
                 turn_context.features.enabled(Feature::RequestPermissions),
             )
             .into_text(),
-        );
+            send_to_llm: true,
+        });
         if let Some(developer_instructions) = turn_context.developer_instructions.as_deref() {
-            developer_sections.push(developer_instructions.to_string());
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.config",
+                title: "Developer: config override",
+                role: Some("developer"),
+                text: developer_instructions.to_string(),
+                send_to_llm: true,
+            });
         }
         // Add developer instructions for memories.
         if turn_context.features.enabled(Feature::MemoryTool)
@@ -3229,20 +3295,38 @@ impl Session {
             && let Some(memory_prompt) =
                 build_memory_tool_developer_instructions(&turn_context.config.codex_home).await
         {
-            developer_sections.push(memory_prompt);
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.memory",
+                title: "Developer: memory tool",
+                role: Some("developer"),
+                text: memory_prompt,
+                send_to_llm: true,
+            });
         }
         // Add developer instructions from collaboration_mode if they exist and are non-empty
         if let Some(collab_instructions) =
             DeveloperInstructions::from_collaboration_mode(&collaboration_mode)
         {
-            developer_sections.push(collab_instructions.into_text());
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.collaboration_mode",
+                title: "Developer: collaboration mode",
+                role: Some("developer"),
+                text: collab_instructions.into_text(),
+                send_to_llm: true,
+            });
         }
         if let Some(realtime_update) = crate::context_manager::updates::build_initial_realtime_item(
             reference_context_item.as_ref(),
             previous_turn_settings.as_ref(),
             turn_context,
         ) {
-            developer_sections.push(realtime_update.into_text());
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.realtime",
+                title: "Developer: realtime",
+                role: Some("developer"),
+                text: realtime_update.into_text(),
+                send_to_llm: true,
+            });
         }
         if self.features.enabled(Feature::Personality)
             && let Some(personality) = turn_context.personality
@@ -3257,64 +3341,265 @@ impl Session {
                         personality,
                     )
             {
-                developer_sections.push(
-                    DeveloperInstructions::personality_spec_message(personality_message)
+                developer_sections.push(PromptSectionDraft {
+                    id: "developer.personality",
+                    title: "Developer: personality",
+                    role: Some("developer"),
+                    text: DeveloperInstructions::personality_spec_message(personality_message)
                         .into_text(),
-                );
+                    send_to_llm: true,
+                });
             }
         }
         if turn_context.features.enabled(Feature::Apps) {
-            developer_sections.push(render_apps_section());
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.apps",
+                title: "Developer: apps",
+                role: Some("developer"),
+                text: render_apps_section(),
+                send_to_llm: true,
+            });
         }
         if turn_context.features.enabled(Feature::CodexGitCommit)
             && let Some(commit_message_instruction) = commit_message_trailer_instruction(
                 turn_context.config.commit_attribution.as_deref(),
             )
         {
-            developer_sections.push(commit_message_instruction);
+            developer_sections.push(PromptSectionDraft {
+                id: "developer.commit_trailer",
+                title: "Developer: commit trailer",
+                role: Some("developer"),
+                text: commit_message_instruction,
+                send_to_llm: true,
+            });
         }
         if let Some(user_instructions) = turn_context.user_instructions.as_deref() {
-            contextual_user_sections.push(
-                UserInstructions {
+            contextual_user_sections.push(PromptSectionDraft {
+                id: "user.instructions",
+                title: "User context: instructions",
+                role: Some("user"),
+                text: UserInstructions {
                     text: user_instructions.to_string(),
                     directory: turn_context.cwd.to_string_lossy().into_owned(),
                 }
                 .serialize_to_text(),
-            );
+                send_to_llm: true,
+            });
         }
         let subagents = self
             .services
             .agent_control
             .format_environment_context_subagents(self.conversation_id)
             .await;
-        contextual_user_sections.push(
-            EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
+        contextual_user_sections.push(PromptSectionDraft {
+            id: "user.environment_context",
+            title: "User context: environment",
+            role: Some("user"),
+            text: EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
                 .with_subagents(subagents)
                 .serialize_to_xml(),
-        );
-        developer_sections = prompt_hooks.apply_sections(
+            send_to_llm: true,
+        });
+
+        if let Some(hook_text) = prompt_hooks.render_text(
             PromptHookTarget::DeveloperMessage,
             &turn_context.config.codex_home,
-            developer_sections,
-        );
-        contextual_user_sections = prompt_hooks.apply_sections(
+        ) {
+            let hook_section = PromptSectionDraft {
+                id: "developer.hook",
+                title: "Developer: prompt hook",
+                role: Some("developer"),
+                text: hook_text,
+                send_to_llm: true,
+            };
+            match prompt_hooks.merge_mode(PromptHookTarget::DeveloperMessage) {
+                crate::prompt_hooks::PromptHookMergeMode::Append => {
+                    developer_sections.push(hook_section)
+                }
+                crate::prompt_hooks::PromptHookMergeMode::Prepend => {
+                    developer_sections.insert(0, hook_section)
+                }
+                crate::prompt_hooks::PromptHookMergeMode::Replace => {
+                    developer_sections.clear();
+                    developer_sections.push(hook_section);
+                }
+            }
+        }
+        if let Some(hook_text) = prompt_hooks.render_text(
             PromptHookTarget::UserContext,
             &turn_context.config.codex_home,
-            contextual_user_sections,
-        );
+        ) {
+            let hook_section = PromptSectionDraft {
+                id: "user.hook",
+                title: "User context: prompt hook",
+                role: Some("user"),
+                text: hook_text,
+                send_to_llm: true,
+            };
+            match prompt_hooks.merge_mode(PromptHookTarget::UserContext) {
+                crate::prompt_hooks::PromptHookMergeMode::Append => {
+                    contextual_user_sections.push(hook_section)
+                }
+                crate::prompt_hooks::PromptHookMergeMode::Prepend => {
+                    contextual_user_sections.insert(0, hook_section)
+                }
+                crate::prompt_hooks::PromptHookMergeMode::Replace => {
+                    contextual_user_sections.clear();
+                    contextual_user_sections.push(hook_section);
+                }
+            }
+        }
 
-        let mut items = Vec::with_capacity(2);
-        if let Some(developer_message) =
-            crate::context_manager::updates::build_developer_update_item(developer_sections)
-        {
-            items.push(developer_message);
+        InitialPromptSections {
+            developer_sections,
+            contextual_user_sections,
         }
-        if let Some(contextual_user_message) =
-            crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
-        {
-            items.push(contextual_user_message);
+    }
+
+    async fn build_prompt_trace_response(
+        &self,
+        scope: PromptTraceScope,
+    ) -> PromptTraceResponseEvent {
+        let session_configuration = {
+            let state = self.state.lock().await;
+            state.session_configuration.clone()
+        };
+
+        let per_turn_config = Self::build_per_turn_config(&session_configuration);
+        let model_info = self
+            .services
+            .models_manager
+            .get_model_info(
+                session_configuration.collaboration_mode.model(),
+                &per_turn_config,
+            )
+            .await;
+        let skills_outcome = Arc::new(
+            self.services
+                .skills_manager
+                .skills_for_cwd(&session_configuration.cwd, false)
+                .await,
+        );
+        let turn_context = Self::make_turn_context(
+            Some(Arc::clone(&self.services.auth_manager)),
+            &self.services.session_telemetry,
+            session_configuration.provider.clone(),
+            &session_configuration,
+            per_turn_config,
+            model_info,
+            self.services
+                .network_proxy
+                .as_ref()
+                .map(|started| started.proxy().clone()),
+            self.next_internal_sub_id(),
+            Arc::clone(&self.js_repl),
+            skills_outcome,
+        );
+        let prompt_hooks = PromptHooks::load(&turn_context.config.codex_home);
+        let initial_sections = self.collect_initial_prompt_sections(&turn_context).await;
+
+        let mut sections = Vec::new();
+        let push_section = |sections: &mut Vec<PromptTraceSection>, draft: PromptSectionDraft| {
+            sections.push(PromptTraceSection {
+                id: draft.id.to_string(),
+                title: draft.title.to_string(),
+                role: draft.role.map(str::to_string),
+                text: draft.text,
+                send_to_llm: draft.send_to_llm,
+            });
+        };
+
+        let merged_developer = initial_sections
+            .developer_sections
+            .iter()
+            .map(|section| section.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let merged_user = initial_sections
+            .contextual_user_sections
+            .iter()
+            .map(|section| section.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let review_prompt = prompt_hooks.apply_text(
+            PromptHookTarget::ReviewPrompt,
+            &turn_context.config.codex_home,
+            crate::REVIEW_PROMPT.to_string(),
+        );
+        let compact_prompt = turn_context.compact_prompt().to_string();
+
+        match scope {
+            PromptTraceScope::All | PromptTraceScope::Base => {
+                sections.push(PromptTraceSection {
+                    id: "base.instructions".to_string(),
+                    title: "Base instructions".to_string(),
+                    role: None,
+                    text: session_configuration.base_instructions.clone(),
+                    send_to_llm: true,
+                });
+            }
+            _ => {}
         }
-        items
+
+        match scope {
+            PromptTraceScope::All | PromptTraceScope::Developer => {
+                for draft in initial_sections.developer_sections.clone() {
+                    push_section(&mut sections, draft);
+                }
+                sections.push(PromptTraceSection {
+                    id: "developer.message".to_string(),
+                    title: "Developer message (merged)".to_string(),
+                    role: Some("developer".to_string()),
+                    text: merged_developer,
+                    send_to_llm: true,
+                });
+            }
+            _ => {}
+        }
+
+        match scope {
+            PromptTraceScope::All | PromptTraceScope::User => {
+                for draft in initial_sections.contextual_user_sections.clone() {
+                    push_section(&mut sections, draft);
+                }
+                sections.push(PromptTraceSection {
+                    id: "user.context".to_string(),
+                    title: "User context (merged)".to_string(),
+                    role: Some("user".to_string()),
+                    text: merged_user,
+                    send_to_llm: true,
+                });
+            }
+            _ => {}
+        }
+
+        match scope {
+            PromptTraceScope::All | PromptTraceScope::Compact => {
+                sections.push(PromptTraceSection {
+                    id: "compact.prompt".to_string(),
+                    title: "Compact prompt".to_string(),
+                    role: None,
+                    text: compact_prompt,
+                    send_to_llm: true,
+                });
+            }
+            _ => {}
+        }
+
+        match scope {
+            PromptTraceScope::All | PromptTraceScope::Review => {
+                sections.push(PromptTraceSection {
+                    id: "review.prompt".to_string(),
+                    title: "Review prompt".to_string(),
+                    role: None,
+                    text: review_prompt,
+                    send_to_llm: true,
+                });
+            }
+            _ => {}
+        }
+
+        PromptTraceResponseEvent { scope, sections }
     }
 
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
@@ -3987,6 +4272,10 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                     handlers::list_custom_prompts(&sess, sub.id.clone()).await;
                     false
                 }
+                Op::GetPromptTrace { scope } => {
+                    handlers::get_prompt_trace(&sess, sub.id.clone(), scope).await;
+                    false
+                }
                 Op::ListSkills { cwds, force_reload } => {
                     handlers::list_skills(&sess, sub.id.clone(), cwds, force_reload).await;
                     false
@@ -4122,6 +4411,7 @@ mod handlers {
     use codex_protocol::protocol::ListSkillsResponseEvent;
     use codex_protocol::protocol::McpServerRefreshConfig;
     use codex_protocol::protocol::Op;
+    use codex_protocol::protocol::PromptTraceScope;
     use codex_protocol::protocol::RemoteSkillDownloadedEvent;
     use codex_protocol::protocol::RemoteSkillHazelnutScope;
     use codex_protocol::protocol::RemoteSkillProductSurface;
@@ -4473,6 +4763,14 @@ mod handlers {
             msg: EventMsg::ListCustomPromptsResponse(ListCustomPromptsResponseEvent {
                 custom_prompts,
             }),
+        };
+        sess.send_event_raw(event).await;
+    }
+
+    pub async fn get_prompt_trace(sess: &Session, sub_id: String, scope: PromptTraceScope) {
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::PromptTraceResponse(sess.build_prompt_trace_response(scope).await),
         };
         sess.send_event_raw(event).await;
     }
@@ -6259,6 +6557,7 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
         | EventMsg::GetHistoryEntryResponse(_)
         | EventMsg::McpListToolsResponse(_)
         | EventMsg::ListCustomPromptsResponse(_)
+        | EventMsg::PromptTraceResponse(_)
         | EventMsg::ListSkillsResponse(_)
         | EventMsg::ListRemoteSkillsResponse(_)
         | EventMsg::RemoteSkillDownloaded(_)

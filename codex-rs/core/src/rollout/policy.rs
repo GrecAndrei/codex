@@ -157,6 +157,7 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::ListCustomPromptsResponse(_)
+        | EventMsg::PromptTraceResponse(_)
         | EventMsg::ListSkillsResponse(_)
         | EventMsg::ListRemoteSkillsResponse(_)
         | EventMsg::RemoteSkillDownloaded(_)

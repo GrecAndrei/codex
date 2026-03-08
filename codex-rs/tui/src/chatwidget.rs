@@ -124,6 +124,8 @@ use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PromptTraceResponseEvent;
+use codex_protocol::protocol::PromptTraceScope;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
@@ -4037,6 +4039,24 @@ impl ChatWidget {
             SlashCommand::DebugConfig => {
                 self.add_debug_config_output();
             }
+            SlashCommand::Prompts => {
+                self.add_prompt_trace_output(PromptTraceScope::All);
+            }
+            SlashCommand::PromptsBase => {
+                self.add_prompt_trace_output(PromptTraceScope::Base);
+            }
+            SlashCommand::PromptsDev => {
+                self.add_prompt_trace_output(PromptTraceScope::Developer);
+            }
+            SlashCommand::PromptsUser => {
+                self.add_prompt_trace_output(PromptTraceScope::User);
+            }
+            SlashCommand::PromptsCompact => {
+                self.add_prompt_trace_output(PromptTraceScope::Compact);
+            }
+            SlashCommand::PromptsReview => {
+                self.add_prompt_trace_output(PromptTraceScope::Review);
+            }
             SlashCommand::Statusline => {
                 self.open_status_line_setup();
             }
@@ -4814,6 +4834,7 @@ impl ChatWidget {
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
+            EventMsg::PromptTraceResponse(ev) => self.on_prompt_trace_response(ev),
             EventMsg::ListSkillsResponse(ev) => self.on_list_skills(ev),
             EventMsg::ListRemoteSkillsResponse(_) | EventMsg::RemoteSkillDownloaded(_) => {}
             EventMsg::SkillsUpdateAvailable => {
@@ -5158,6 +5179,10 @@ impl ChatWidget {
             &self.config,
             self.session_network_proxy.as_ref(),
         ));
+    }
+
+    pub(crate) fn add_prompt_trace_output(&mut self, scope: PromptTraceScope) {
+        self.submit_op(Op::GetPromptTrace { scope });
     }
 
     fn open_status_line_setup(&mut self) {
@@ -8119,6 +8144,11 @@ impl ChatWidget {
         debug!("received {len} custom prompts");
         // Forward to bottom pane so the slash popup can show them now.
         self.bottom_pane.set_custom_prompts(ev.custom_prompts);
+    }
+
+    fn on_prompt_trace_response(&mut self, ev: PromptTraceResponseEvent) {
+        self.add_to_history(history_cell::new_prompt_trace_output(ev));
+        self.request_redraw();
     }
 
     fn on_list_skills(&mut self, ev: ListSkillsResponseEvent) {

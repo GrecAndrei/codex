@@ -56,6 +56,7 @@ use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::McpAuthStatus;
 use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::PromptTraceResponseEvent;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
@@ -1895,6 +1896,53 @@ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
     // before the text. VS16 is intentionally omitted to keep spacing tighter
     // in terminals like Ghostty.
     let lines: Vec<Line<'static>> = vec![vec![format!("■ {message}").red()].into()];
+    PlainHistoryCell { lines }
+}
+
+pub(crate) fn new_prompt_trace_output(ev: PromptTraceResponseEvent) -> PlainHistoryCell {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let scope_label = serde_json::to_string(&ev.scope)
+        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    lines.push(
+        vec![
+            "• ".dim(),
+            "Prompt trace".bold().cyan(),
+            format!(" ({scope_label})").dark_gray(),
+        ]
+        .into(),
+    );
+    lines.push(Line::from(""));
+
+    for section in ev.sections {
+        lines.push(vec![format!("## {}", section.title).bold()].into());
+        lines.push(vec!["id: ".dark_gray(), section.id.into()].into());
+        if let Some(role) = section.role {
+            lines.push(vec!["role: ".dark_gray(), role.into()].into());
+        }
+        lines.push(
+            vec![
+                "send_to_llm: ".dark_gray(),
+                if section.send_to_llm {
+                    "true".green()
+                } else {
+                    "false".yellow()
+                },
+            ]
+            .into(),
+        );
+        lines.push(Line::from(""));
+        if section.text.is_empty() {
+            lines.push(vec!["<empty>".dark_gray()].into());
+        } else {
+            for line in section.text.lines() {
+                lines.push(Line::from(line.to_string()));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
     PlainHistoryCell { lines }
 }
 
