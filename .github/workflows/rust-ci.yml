@@ -16,6 +16,7 @@ jobs:
     outputs:
       codex: ${{ steps.detect.outputs.codex }}
       workflows: ${{ steps.detect.outputs.workflows }}
+      is_upstream: ${{ github.repository == 'openai/codex' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -90,7 +91,7 @@ jobs:
     timeout-minutes: 30
     needs: changed
     # Keep job-level if to avoid spinning up runners when not needed
-    if: ${{ needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push' }}
+    if: ${{ (needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push') && needs.changed.outputs.is_upstream == 'true' }}
     defaults:
       run:
         working-directory: codex-rs
@@ -450,6 +451,73 @@ jobs:
             /var/cache/apt
           key: apt-${{ matrix.runner }}-${{ matrix.target }}-v1
 
+
+  fork_lint_build:
+    name: Lint/Build — fork ubuntu-24.04 - x86_64-unknown-linux-gnu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: changed
+    if: ${{ (needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push') && needs.changed.outputs.is_upstream != 'true' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev libasound2-dev libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: clippy
+      - name: cargo clippy
+        run: cargo clippy --target x86_64-unknown-linux-gnu --all-features --tests --profile dev --timings -- -D warnings
+
+  fork_tests:
+    name: Tests — fork ubuntu-24.04 - x86_64-unknown-linux-gnu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: changed
+    if: ${{ (needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push') && needs.changed.outputs.is_upstream != 'true' }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Node.js for js_repl tests
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: codex-rs/node-version.txt
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev libasound2-dev libsqlite3-dev
+      - name: Install DotSlash
+        uses: facebook/install-dotslash@v2
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2
+        with:
+          tool: nextest
+          version: 0.9.103
+      - name: Enable unprivileged user namespaces (Linux)
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: tests
+        run: cargo nextest run --all-features --no-fail-fast --target x86_64-unknown-linux-gnu --cargo-profile ci-test --timings
+        env:
+          RUST_BACKTRACE: 1
+          NEXTEST_STATUS_LEVEL: leak
+
   tests:
     name: Tests — ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
@@ -657,7 +725,7 @@ jobs:
   # --- Gatherer job that you mark as the ONLY required status -----------------
   results:
     name: CI results (required)
-    needs: [changed, general, cargo_shear, lint_build, tests]
+    needs: [changed, general, cargo_shear, lint_build, fork_lint_build, tests, fork_tests]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -666,8 +734,10 @@ jobs:
         run: |
           echo "general: ${{ needs.general.result }}"
           echo "shear  : ${{ needs.cargo_shear.result }}"
-          echo "lint   : ${{ needs.lint_build.result }}"
-          echo "tests  : ${{ needs.tests.result }}"
+          echo "lint(upstream): ${{ needs.lint_build.result }}"
+          echo "lint(fork)    : ${{ needs.fork_lint_build.result }}"
+          echo "tests(upstream): ${{ needs.tests.result }}"
+          echo "tests(fork)    : ${{ needs.fork_tests.result }}"
 
           # If nothing relevant changed (PR touching only root README, etc.),
           # declare success regardless of other jobs.
@@ -676,11 +746,17 @@ jobs:
             exit 0
           fi
 
-          # Otherwise require the jobs to have succeeded
+          # General checks always matter.
           [[ '${{ needs.general.result }}' == 'success' ]] || { echo 'general failed'; exit 1; }
           [[ '${{ needs.cargo_shear.result }}' == 'success' ]] || { echo 'cargo_shear failed'; exit 1; }
-          [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
-          [[ '${{ needs.tests.result }}' == 'success' ]] || { echo 'tests failed'; exit 1; }
+
+          if [[ '${{ needs.changed.outputs.is_upstream }}' == 'true' ]]; then
+            [[ '${{ needs.lint_build.result }}' == 'success' ]] || { echo 'lint_build failed'; exit 1; }
+            [[ '${{ needs.tests.result }}' == 'success' ]] || { echo 'tests failed'; exit 1; }
+          else
+            [[ '${{ needs.fork_lint_build.result }}' == 'success' ]] || { echo 'fork_lint_build failed'; exit 1; }
+            [[ '${{ needs.fork_tests.result }}' == 'success' ]] || { echo 'fork_tests failed'; exit 1; }
+          fi
 
       - name: sccache summary note
         if: always()
