@@ -31,12 +31,14 @@ jobs:
       - uses: facebook/install-dotslash@v2
 
       - name: Stage npm package
+        if: ${{ github.repository == 'openai/codex' }}
         id: stage_npm_package
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Use a rust-release version that includes all native binaries.
+          # This staging flow depends on upstream rust-release artifacts/tags.
+          # Forks usually do not have that release lineage, so this step is skipped there.
           CODEX_VERSION=0.74.0
           OUTPUT_DIR="${RUNNER_TEMP}"
           python3 ./scripts/stage_npm_packages.py \
@@ -47,6 +49,7 @@ jobs:
           echo "pack_output=$PACK_OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload staged npm package artifact
+        if: ${{ github.repository == 'openai/codex' }}
         uses: actions/upload-artifact@v7
         with:
           name: codex-npm-staging
