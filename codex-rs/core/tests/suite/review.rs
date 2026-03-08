@@ -702,7 +702,9 @@ text = "extra review hook"
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request = request_log.single_request().body_json();
-    let instructions = request["instructions"].as_str().expect("instructions string");
+    let instructions = request["instructions"]
+        .as_str()
+        .expect("instructions string");
     assert!(instructions.contains(REVIEW_PROMPT));
     assert!(instructions.contains("extra review hook"));
     assert!(codex_home.path().join("docs/prompt-hooks.md").is_file());

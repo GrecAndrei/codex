@@ -1732,7 +1732,8 @@ text = "user hook"
     let mut builder = test_codex()
         .with_home(codex_home.clone())
         .with_pre_build_hook(move |home| {
-            std::fs::write(home.join("prompt-hooks.toml"), prompt_hooks).expect("write prompt hooks");
+            std::fs::write(home.join("prompt-hooks.toml"), prompt_hooks)
+                .expect("write prompt hooks");
         })
         .with_auth(CodexAuth::from_api_key("Test API Key"));
     let codex = builder
@@ -1793,7 +1794,12 @@ text = "user hook"
     );
 
     assert!(codex_home.path().join("docs/prompt-hooks.md").is_file());
-    assert!(codex_home.path().join("docs/prompt-hooks.example.toml").is_file());
+    assert!(
+        codex_home
+            .path()
+            .join("docs/prompt-hooks.example.toml")
+            .is_file()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
