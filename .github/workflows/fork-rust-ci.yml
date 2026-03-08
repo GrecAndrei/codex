@@ -1,0 +1,60 @@
+name: fork-rust-ci
+
+on:
+  push:
+    tags-ignore:
+      - "rust-v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+  test-linux-x64:
+    name: Test — x86_64 Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config \
+            libcap-dev \
+            libasound2-dev \
+            libsqlite3-dev
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: clippy
+
+      - name: cargo test -p codex-protocol
+        run: cargo test -p codex-protocol
+
+      - name: cargo test -p codex-tui --no-run
+        run: cargo test -p codex-tui --no-run
+
+      - name: cargo clippy -p codex-tui
+        run: cargo clippy -p codex-tui --tests -- -D warnings
