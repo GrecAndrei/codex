@@ -17,6 +17,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 jobs:
   test:
+    if: github.repository == 'openai/codex' || matrix.os == 'ubuntu-24.04'
     strategy:
       fail-fast: false
       matrix:
