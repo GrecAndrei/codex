@@ -451,7 +451,6 @@ jobs:
             /var/cache/apt
           key: apt-${{ matrix.runner }}-${{ matrix.target }}-v1
 
-
   fork_lint_build:
     name: Lint/Build — fork ubuntu-24.04 - x86_64-unknown-linux-gnu
     runs-on: ubuntu-24.04
@@ -523,7 +522,7 @@ jobs:
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 30
     needs: changed
-    if: ${{ needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push' }}
+    if: ${{ (needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push') && needs.changed.outputs.is_upstream == 'true' }}
     defaults:
       run:
         working-directory: codex-rs
@@ -725,7 +724,16 @@ jobs:
   # --- Gatherer job that you mark as the ONLY required status -----------------
   results:
     name: CI results (required)
-    needs: [changed, general, cargo_shear, lint_build, fork_lint_build, tests, fork_tests]
+    needs:
+      [
+        changed,
+        general,
+        cargo_shear,
+        lint_build,
+        fork_lint_build,
+        tests,
+        fork_tests,
+      ]
     if: always()
     runs-on: ubuntu-24.04
     steps:

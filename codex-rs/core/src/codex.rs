@@ -3490,7 +3490,7 @@ impl Session {
             self.services
                 .network_proxy
                 .as_ref()
-                .map(|started| started.proxy().clone()),
+                .map(|started| started.proxy()),
             self.next_internal_sub_id(),
             Arc::clone(&self.js_repl),
             skills_outcome,
@@ -3559,8 +3559,8 @@ impl Session {
 
         match scope {
             PromptTraceScope::All | PromptTraceScope::User => {
-                for draft in initial_sections.contextual_user_sections.clone() {
-                    push_section(&mut sections, draft);
+                for draft in &initial_sections.contextual_user_sections {
+                    push_section(&mut sections, draft.clone());
                 }
                 sections.push(PromptTraceSection {
                     id: "user.context".to_string(),
