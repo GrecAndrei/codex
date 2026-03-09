@@ -1927,7 +1927,7 @@ pub(crate) fn new_prompt_trace_output(ev: PromptTraceResponseEvent) -> PlainHist
                 if section.send_to_llm {
                     "true".green()
                 } else {
-                    "false".yellow()
+                    "false".red()
                 },
             ]
             .into(),
