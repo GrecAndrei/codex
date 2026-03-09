@@ -105,18 +105,12 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
         })
         .await;
 
-    let output = match resp {
-        Ok(ToolOutput::Function {
+    let output = match resp.expect("expected Ok result") {
+        ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
             ..
-        }) => content,
-        #[cfg(target_os = "linux")]
-        Err(FunctionCallError::RespondToModel(message))
-            if message == "execution error: LandlockSandboxExecutableNotProvided" =>
-        {
-            return;
-        }
-        other => panic!("unexpected shell result: {other:?}"),
+        } => content,
+        _ => panic!("unexpected tool output"),
     };
 
     #[derive(Deserialize, PartialEq, Eq, Debug)]
