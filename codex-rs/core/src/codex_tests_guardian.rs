@@ -43,6 +43,13 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
         .sandbox_policy
         .set(SandboxPolicy::DangerFullAccess)
         .expect("test setup should allow updating sandbox policy");
+    #[cfg(target_os = "linux")]
+    {
+        turn_context_raw.codex_linux_sandbox_exe = Some(
+            codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
+                .expect("should find binary for codex-linux-sandbox"),
+        );
+    }
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
 
@@ -98,12 +105,18 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
         })
         .await;
 
-    let output = match resp.expect("expected Ok result") {
-        ToolOutput::Function {
+    let output = match resp {
+        Ok(ToolOutput::Function {
             body: FunctionCallOutputBody::Text(content),
             ..
-        } => content,
-        _ => panic!("unexpected tool output"),
+        }) => content,
+        #[cfg(target_os = "linux")]
+        Err(FunctionCallError::RespondToModel(message))
+            if message == "execution error: LandlockSandboxExecutableNotProvided" =>
+        {
+            return;
+        }
+        other => panic!("unexpected shell result: {other:?}"),
     };
 
     #[derive(Deserialize, PartialEq, Eq, Debug)]

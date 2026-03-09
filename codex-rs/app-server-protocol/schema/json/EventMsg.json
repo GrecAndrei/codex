@@ -2474,6 +2474,34 @@
           "type": "object"
         },
         {
+          "description": "Prompt stack snapshot for the current session.",
+          "properties": {
+            "scope": {
+              "$ref": "#/definitions/PromptTraceScope"
+            },
+            "sections": {
+              "items": {
+                "$ref": "#/definitions/PromptTraceSection"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "prompt_trace_response"
+              ],
+              "title": "PromptTraceResponseEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "scope",
+            "sections",
+            "type"
+          ],
+          "title": "PromptTraceResponseEventMsg",
+          "type": "object"
+        },
+        {
           "description": "List of skills available to the agent.",
           "properties": {
             "skills": {
@@ -4227,6 +4255,46 @@
         "unknown"
       ],
       "type": "string"
+    },
+    "PromptTraceScope": {
+      "enum": [
+        "all",
+        "base",
+        "developer",
+        "user",
+        "compact",
+        "review"
+      ],
+      "type": "string"
+    },
+    "PromptTraceSection": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "send_to_llm": {
+          "default": false,
+          "type": "boolean"
+        },
+        "text": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "title"
+      ],
+      "type": "object"
     },
     "RateLimitSnapshot": {
       "properties": {
@@ -8283,6 +8351,34 @@
         "type"
       ],
       "title": "ListCustomPromptsResponseEventMsg",
+      "type": "object"
+    },
+    {
+      "description": "Prompt stack snapshot for the current session.",
+      "properties": {
+        "scope": {
+          "$ref": "#/definitions/PromptTraceScope"
+        },
+        "sections": {
+          "items": {
+            "$ref": "#/definitions/PromptTraceSection"
+          },
+          "type": "array"
+        },
+        "type": {
+          "enum": [
+            "prompt_trace_response"
+          ],
+          "title": "PromptTraceResponseEventMsgType",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "sections",
+        "type"
+      ],
+      "title": "PromptTraceResponseEventMsg",
       "type": "object"
     },
     {
