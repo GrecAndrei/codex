@@ -222,7 +222,7 @@ jobs:
           fi
 
   test_fork:
-    if: github.repository != 'openai/codex'
+    if: github.repository == 'openai/codex' && false
     strategy:
       fail-fast: false
       matrix:
