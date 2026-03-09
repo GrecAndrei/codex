@@ -3490,7 +3490,7 @@ impl Session {
             self.services
                 .network_proxy
                 .as_ref()
-                .map(|started| started.proxy()),
+                .map(super::config::network_proxy_spec::StartedNetworkProxy::proxy),
             self.next_internal_sub_id(),
             Arc::clone(&self.js_repl),
             skills_outcome,
